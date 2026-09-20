@@ -1,0 +1,2 @@
+# Сюда при сборке .deb копируется результат PyInstaller: dist/bes-ocr/*
+# См. docs/BUILD.md

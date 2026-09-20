@@ -1,0 +1,24 @@
+[project]
+name = "bes-ocr"
+version = "0.1.0"
+description = "BES OCR — локальный конвертер PDF в редактируемый DOCX"
+requires-python = ">=3.9"
+dependencies = [
+    "PySide6>=6.5",
+    "PyMuPDF>=1.23",
+    "pdfplumber>=0.10",
+    "python-docx>=1.0",
+    "opencv-python-headless>=4.8",
+    "pytesseract>=0.3.10",
+    "Pillow>=10.0",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4", "reportlab>=4.0"]
+
+[project.scripts]
+bes-ocr = "bes_ocr.app:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

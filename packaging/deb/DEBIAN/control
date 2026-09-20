@@ -1,0 +1,9 @@
+Package: bes-ocr
+Version: 0.1.0
+Section: graphics
+Priority: optional
+Architecture: amd64
+Depends: tesseract-ocr, tesseract-ocr-rus, tesseract-ocr-eng, libegl1, libgl1
+Maintainer: BES OCR
+Description: Локальный конвертер PDF в редактируемый DOCX с распознаванием
+ таблиц, структуры документа и OCR (ru/eng). Работает полностью офлайн.

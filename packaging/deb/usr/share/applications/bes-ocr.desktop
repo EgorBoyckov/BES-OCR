@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=BES OCR
+Comment=PDF → Word
+Exec=/opt/bes-ocr/bes-ocr
+Icon=bes-ocr
+Terminal=false
+Categories=Office;Graphics;

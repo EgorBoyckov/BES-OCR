@@ -58,22 +58,35 @@ class LayoutLine:
         return statistics.median([w.size_pt for w in self.words]) if self.words else 11.0
 
 
-def words_to_lines(words: list[LayoutWord], y_tolerance: float = 3.0) -> list[LayoutLine]:
-    """Группирует слова в строки по вертикальному перекрытию, слева направо."""
+def words_to_lines(words: list[LayoutWord], y_tolerance: float = 4.0) -> list[LayoutLine]:
+    """Группирует слова в строки по вертикальному перекрытию, слева направо.
+
+    Однопроходная группировка по СКОЛЬЗЯЩЕМУ СРЕДНЕМУ центру накопленной
+    строки (а не по её мгновенному min/max bbox, который дрейфует по мере
+    добавления слов и делает результат чувствительным к порядку обработки).
+    На реальных сканах слова одной и той же визуальной строки (особенно
+    из независимо распознанных смежных блоков текста) редко имеют абсолютно
+    одинаковый y0/y1 (дрожание OCR-рамок), и старая версия (сравнение с
+    каждой уже существующей строкой по её текущему bbox) иногда
+    непредсказуемо не сливала слова одной и той же строки.
+    """
     if not words:
         return []
-    sorted_words = sorted(words, key=lambda w: (round((w.y0 + w.y1) / 2), w.x0))
+    sorted_words = sorted(words, key=lambda w: ((w.y0 + w.y1) / 2, w.x0))
     lines: list[LayoutLine] = []
+    current: list[LayoutWord] = []
+    current_center = 0.0
     for w in sorted_words:
         center = (w.y0 + w.y1) / 2
-        placed = False
-        for line in lines:
-            if abs(((line.y0 + line.y1) / 2) - center) <= y_tolerance + (line.y1 - line.y0) * 0.3:
-                line.words.append(w)
-                placed = True
-                break
-        if not placed:
-            lines.append(LayoutLine(words=[w]))
+        if current:
+            avg_height = sum(ww.y1 - ww.y0 for ww in current) / len(current)
+            if abs(center - current_center) > y_tolerance + avg_height * 0.35:
+                lines.append(LayoutLine(words=current))
+                current = []
+        current.append(w)
+        current_center = sum((ww.y0 + ww.y1) / 2 for ww in current) / len(current)
+    if current:
+        lines.append(LayoutLine(words=current))
     for line in lines:
         line.words.sort(key=lambda w: w.x0)
     lines.sort(key=lambda ln: ln.y0)

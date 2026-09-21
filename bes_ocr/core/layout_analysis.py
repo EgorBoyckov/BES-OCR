@@ -115,7 +115,11 @@ def build_blocks(
     if not lines:
         return []
 
-    body_size = statistics.median([ln.median_size for ln in lines])
+    # Медиану "обычного" размера текста считаем по строкам минимум с двумя
+    # словами — короткие/шумные строки (одно слово, особенно артефакт OCR)
+    # слишком волатильны и могут исказить оценку типичного размера шрифта.
+    multi_word_lines = [ln for ln in lines if len(ln.words) >= 2]
+    body_size = statistics.median([ln.median_size for ln in (multi_word_lines or lines)])
     blocks: list[object] = []
     prev_line: LayoutLine | None = None
 
@@ -128,7 +132,13 @@ def build_blocks(
         alignment = _alignment_for_line(line, page_width)
         runs = _line_to_paragraph_runs(line)
 
-        is_heading = line.median_size > body_size * 1.15 and len(text) < 140
+        # Заголовком считаем только достаточно длинную по смыслу строку
+        # (не менее 2 слов или одно длинное слово) с заметно (не на глаз)
+        # более крупным шрифтом — единичное короткое "слово" на OCR-строке
+        # часто оказывается артефактом распознавания с завышенной оценкой
+        # размера (из-за высоты случайного штриха/засечки), а не заголовком.
+        heading_candidate = len(line.words) >= 2 or (len(line.words) == 1 and len(text) >= 4)
+        is_heading = heading_candidate and line.median_size > body_size * 1.25 and len(text) < 140
         ordered_match = _ORDERED_RE.match(text)
         bullet_match = _BULLET_RE.match(text)
 

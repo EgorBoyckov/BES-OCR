@@ -73,6 +73,13 @@ def process_page(
         else:
             image_bgr, zoom = pdf.render_page_image(page_number, dpi=settings.render_dpi)
             px_to_pt = 1.0 / zoom
+            # Слова распознаются на исходном (не повёрнутом) изображении:
+            # поворот через warpAffine (даже INTER_CUBIC) слегка размывает
+            # мелкий текст и заметно портит точность OCR на некрупном шрифте.
+            # Небольшой перекос скана сам Tesseract переносит нормально на
+            # уровне целой страницы. Выравнивание нужно только для поиска
+            # линий таблиц (см. table_detection.detect_tables_opencv) — там
+            # оно выполняется отдельно и только для этой задачи.
             ocr_words = ocr_engine.recognize_words(image_bgr)
 
             if ocr_engine.is_likely_handwriting_or_noise(ocr_words):

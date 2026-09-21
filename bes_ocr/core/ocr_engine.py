@@ -26,19 +26,43 @@ class OcrWord:
     line_id: int
 
 
+def estimate_skew_angle(image_bgr: np.ndarray) -> float:
+    """Оценивает угол перекоса скана по протяжённым почти горизонтальным
+    отрезкам (текстовые строки, линии таблиц) через преобразование Хафа.
+
+    minAreaRect по всем ненулевым пикселям страницы (более простой и ранее
+    использовавшийся подход) на практике нечувствителен к типичному
+    небольшому перекосу скана (доли градуса — единицы градусов): угол
+    описывающего прямоугольника всей страницы определяется общей формой
+    страницы, а не тонким наклоном строк/линий, и часто округляется до 0
+    даже при заметном на таблице перекосе. Хаф по конкретным отрезкам даёт
+    устойчивую оценку в таких случаях.
+    """
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    binary = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 25, 10
+    )
+    h, w = binary.shape
+    lines = cv2.HoughLinesP(
+        binary, 1, np.pi / 1440, threshold=200, minLineLength=int(w * 0.15), maxLineGap=20
+    )
+    if lines is None:
+        return 0.0
+    angles = []
+    weights = []
+    for x1, y1, x2, y2 in lines.reshape(-1, 4):
+        angle = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+        if abs(angle) < 10:
+            angles.append(angle)
+            weights.append(np.hypot(x2 - x1, y2 - y1))
+    if not angles:
+        return 0.0
+    return float(np.average(angles, weights=weights))
+
+
 def deskew(image_bgr: np.ndarray) -> np.ndarray:
     """Определяет и исправляет небольшой перекос скана."""
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.bitwise_not(gray)
-    thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
-    coords = cv2.findNonZero(thresh)
-    if coords is None or len(coords) < 50:
-        return image_bgr
-    angle = cv2.minAreaRect(coords)[-1]
-    if angle < -45:
-        angle = -(90 + angle)
-    else:
-        angle = -angle
+    angle = estimate_skew_angle(image_bgr)
     if abs(angle) < 0.1 or abs(angle) > 15:
         # Не трогаем: либо уже ровно, либо это, вероятно, ошибка детекции угла.
         return image_bgr

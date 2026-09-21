@@ -12,7 +12,7 @@ from ..config.settings import Settings
 from .errors import PageProcessingError
 from .layout_analysis import LayoutWord, build_blocks
 from .models import BBox, ImageBlock, Page
-from .ocr_engine import OcrEngine
+from .ocr_engine import OcrEngine, find_noise_regions
 from .pdf_source import PdfSource
 from .table_detection import detect_tables_img2table, detect_tables_pdfplumber
 from .text_layer import assess_text_layer
@@ -51,6 +51,7 @@ def process_page(
         page = Page(number=page_number + 1, width_pt=width_pt, height_pt=height_pt)
 
         assessment = assess_text_layer(pdf, page_number, settings)
+        noise_blocks: list[tuple[float, ImageBlock]] = []
 
         if assessment.usable:
             tables = detect_tables_pdfplumber(pdf_path, page_number)
@@ -94,6 +95,61 @@ def process_page(
 
             tables = detect_tables_img2table(image_bgr, settings, px_to_pt)
 
+            img_h, img_w = image_bgr.shape[:2]
+            table_bboxes_px = [
+                (t.bbox.x0 / px_to_pt, t.bbox.y0 / px_to_pt, t.bbox.x1 / px_to_pt, t.bbox.y1 / px_to_pt)
+                for t in tables
+                if t.bbox
+            ]
+            words_outside_tables_px = [
+                w
+                for w in ocr_words
+                if not any(
+                    bx0 - 1 <= (w.x0 + w.x1) / 2 <= bx1 + 1 and by0 - 1 <= (w.y0 + w.y1) / 2 <= by1 + 1
+                    for bx0, by0, bx1, by1 in table_bboxes_px
+                )
+            ]
+            # Локальные пятна визуального шума (печати, подписи, помарки,
+            # наложенные на печатный текст) — п.3 ТЗ: сохраняем такой
+            # участок как изображение вместо потока ошибочных символов.
+            # Ищем только вне уже найденных таблиц, иначе короткие
+            # обёрнутые значения в узких столбцах (даты, номера) ложно
+            # похожи на "пятно шума".
+            noise_regions_px = find_noise_regions(words_outside_tables_px, settings, img_w, img_h)
+            if noise_regions_px:
+                import cv2
+
+                pad = 15
+                for nx0, ny0, nx1, ny1 in noise_regions_px:
+                    cx0, cy0 = max(0, int(nx0) - pad), max(0, int(ny0) - pad)
+                    cx1, cy1 = min(img_w, int(nx1) + pad), min(img_h, int(ny1) + pad)
+                    crop = image_bgr[cy0:cy1, cx0:cx1]
+                    if crop.size == 0:
+                        continue
+                    ok, buf = cv2.imencode(".png", crop)
+                    if not ok:
+                        continue
+                    noise_blocks.append(
+                        (
+                            cy0 * px_to_pt,
+                            ImageBlock(
+                                data=buf.tobytes(),
+                                width_px=crop.shape[1],
+                                height_px=crop.shape[0],
+                                bbox=BBox(cx0 * px_to_pt, cy0 * px_to_pt, cx1 * px_to_pt, cy1 * px_to_pt),
+                            ),
+                        )
+                    )
+                logger.info(
+                    "Страница %d: %d участок(ов) с визуальным шумом (печать/подпись) сохранены как изображение",
+                    page_number + 1,
+                    len(noise_blocks),
+                )
+
+            def _in_noise_region(w) -> bool:
+                cx, cy = (w.x0 + w.x1) / 2, (w.y0 + w.y1) / 2
+                return any(nx0 <= cx <= nx1 and ny0 <= cy <= ny1 for nx0, ny0, nx1, ny1 in noise_regions_px)
+
             words = [
                 LayoutWord(
                     text=w.text,
@@ -104,7 +160,7 @@ def process_page(
                     size_pt=max(6.0, (w.y1 - w.y0) * px_to_pt * 0.8),
                 )
                 for w in ocr_words
-                if w.confidence >= settings.ocr_word_confidence_threshold
+                if w.confidence >= settings.ocr_word_confidence_threshold and not _in_noise_region(w)
             ]
             page.used_ocr = True
 
@@ -119,6 +175,7 @@ def process_page(
         for t in tables:
             y = t.bbox.y0 if t.bbox else 0.0
             ordered.append((y, t))
+        ordered.extend(noise_blocks)
 
         if assessment.usable:
             for img in pdf.extract_images(page_number):

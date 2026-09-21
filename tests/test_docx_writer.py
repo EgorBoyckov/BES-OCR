@@ -2,8 +2,13 @@ import os
 
 from docx import Document as DocxDocument
 
-from bes_ocr.core.docx_writer import build_docx
+from bes_ocr.core.docx_writer import (
+    _compute_page_geometry,
+    _fitted_column_widths,
+    build_docx,
+)
 from bes_ocr.core.models import (
+    BBox,
     Document,
     Heading,
     ImageBlock,
@@ -68,3 +73,74 @@ def test_build_docx_with_image(tmp_path):
 
     reopened = DocxDocument(out_path)
     assert len(reopened.inline_shapes) == 1
+
+
+def test_page_geometry_matches_source_pdf_page_size(tmp_path):
+    """DOCX должен получать размер страницы исходного PDF, а не Letter по
+    умолчанию — иначе перенос строк и пропорции таблиц систематически
+    расходятся с оригиналом даже при верно распознанном содержимом."""
+    document = _sample_document()
+    document.pages[0].width_pt = 595.0
+    document.pages[0].height_pt = 842.0
+
+    out_path = os.path.join(tmp_path, "geom.docx")
+    build_docx(document, out_path)
+
+    reopened = DocxDocument(out_path)
+    section = reopened.sections[0]
+    assert round(section.page_width.pt) == 595
+    assert round(section.page_height.pt) == 842
+
+
+def test_compute_page_geometry_margins_from_content():
+    document = _sample_document()
+    document.pages[0].width_pt = 595.0
+    document.pages[0].height_pt = 842.0
+    for b in document.pages[0].blocks:
+        if isinstance(b, (Heading, Paragraph)):
+            b.bbox = BBox(60.0, 40.0, 500.0, 60.0)
+
+    geometry = _compute_page_geometry(document)
+    assert 40 < geometry.margin_left_pt < 90
+    assert geometry.usable_width_pt < geometry.width_pt
+
+
+def test_compute_page_geometry_falls_back_without_pages():
+    geometry = _compute_page_geometry(Document())
+    assert geometry.width_pt > 0
+    assert geometry.margin_left_pt > 0
+
+
+def test_fitted_column_widths_scales_down_when_too_wide():
+    widths = _fitted_column_widths([100.0, 100.0, 100.0], 3, usable_width_pt=150.0)
+    assert sum(widths) <= 150.0 + 1e-6
+    # пропорции столбцов сохранены (все три равны)
+    assert widths[0] == widths[1] == widths[2]
+
+
+def test_fitted_column_widths_falls_back_to_even_split():
+    widths = _fitted_column_widths([], 4, usable_width_pt=400.0)
+    assert widths == [100.0, 100.0, 100.0, 100.0]
+
+
+def test_table_column_widths_written_to_docx(tmp_path):
+    document = Document()
+    page = Page(number=1, width_pt=595.0, height_pt=842.0)
+    table = Table(col_widths_pt=[200.0, 100.0])
+    table.rows = [
+        TableRow(
+            cells=[
+                TableCell(blocks=[Paragraph(runs=[Run(text="Wide")])]),
+                TableCell(blocks=[Paragraph(runs=[Run(text="Narrow")])]),
+            ]
+        )
+    ]
+    page.blocks.append(table)
+    document.pages.append(page)
+
+    out_path = os.path.join(tmp_path, "widths.docx")
+    build_docx(document, out_path)
+
+    reopened = DocxDocument(out_path)
+    col_widths = [c.width.pt for c in reopened.tables[0].columns]
+    assert col_widths[0] > col_widths[1]

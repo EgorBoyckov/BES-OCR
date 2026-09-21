@@ -124,8 +124,29 @@ def detect_tables_pdfplumber(pdf_path: str, page_number: int) -> list[Table]:
                     para = Paragraph(runs=[Run(text=text)]) if text else Paragraph(runs=[Run(text="")])
                     row_obj.cells.append(TableCell(blocks=[para], row_span=row_span, col_span=col_span))
                 table.rows.append(row_obj)
+            table.col_widths_pt = _column_widths_from_spans(grid_bbox, spans, n_cols)
             tables.append(table)
     return tables
+
+
+def _column_widths_from_spans(
+    grid_bbox: list[list[tuple | None]], spans: dict[tuple[int, int], tuple[int, int]], n_cols: int
+) -> list[float]:
+    """Ширина каждого столбца — по ячейкам без горизонтального объединения
+    (col_span == 1), иначе ширина объединённой на несколько столбцов ячейки
+    ошибочно приписалась бы каждому из них. Нужна, чтобы таблица в DOCX
+    сохраняла пропорции исходной, а не получала одинаковые по ширине
+    столбцы по умолчанию."""
+    widths = [0.0] * n_cols
+    for (r, c), (_, col_span) in spans.items():
+        if col_span != 1 or r >= len(grid_bbox) or c >= len(grid_bbox[r]):
+            continue
+        bbox = grid_bbox[r][c]
+        if bbox is None:
+            continue
+        x0, _, x1, _ = bbox
+        widths[c] = max(widths[c], x1 - x0)
+    return [w if w > 0 else 50.0 for w in widths]
 
 
 def detect_tables_img2table(image_bgr, settings: Settings, px_to_pt: float) -> list[Table]:
@@ -220,4 +241,16 @@ def _convert_img2table(extracted_table, px_to_pt: float) -> Table | None:
                 )
             )
         table.rows.append(row_obj)
+
+    # Ширина столбца — по ячейкам, которые НЕ являются горизонтальным
+    # объединением (col_span == 1): иначе ширина объединённой на несколько
+    # столбцов ячейки ошибочно приписалась бы каждому из них.
+    n_cols = max((len(r) for r in key_grid), default=0)
+    widths_px = [0.0] * n_cols
+    for (r, c), (row_span, col_span) in spans.items():
+        if col_span != 1:
+            continue
+        x0, _, x1, _ = key_grid[r][c]
+        widths_px[c] = max(widths_px[c], x1 - x0)
+    table.col_widths_pt = [(w if w > 0 else 50.0) * px_to_pt for w in widths_px]
     return table

@@ -10,7 +10,7 @@ import re
 import statistics
 from dataclasses import dataclass, field
 
-from .models import Alignment, Heading, ListItem, Paragraph, Run
+from .models import BBox, Alignment, Heading, ListItem, Paragraph, Run
 
 _ORDERED_RE = re.compile(r"^\s*(\d{1,3}|[a-zA-Zа-яА-Я])[.)]\s+")
 _BULLET_RE = re.compile(r"^\s*[•\-•‣◦⁃*]\s+")
@@ -155,9 +155,11 @@ def build_blocks(
         ordered_match = _ORDERED_RE.match(text)
         bullet_match = _BULLET_RE.match(text)
 
+        line_bbox = BBox(line.x0, line.y0, line.x1, line.y1)
+
         if is_heading:
             level = 1 if line.median_size > body_size * 1.45 else 2
-            blocks.append(Heading(runs=runs, alignment=alignment, level=level, bbox=None))
+            blocks.append(Heading(runs=runs, alignment=alignment, level=level, bbox=line_bbox))
         elif ordered_match or bullet_match:
             marker = ordered_match.group(0).strip() if ordered_match else bullet_match.group(0).strip()
             clean_text = text[len(ordered_match.group(0)) :] if ordered_match else text[len(bullet_match.group(0)) :]
@@ -169,13 +171,21 @@ def build_blocks(
                     ordered=bool(ordered_match),
                     marker=marker,
                     indent_pt=line.x0,
+                    bbox=line_bbox,
                 )
             )
         elif new_paragraph or not blocks or not isinstance(blocks[-1], Paragraph) or isinstance(blocks[-1], (Heading, ListItem)):
-            blocks.append(Paragraph(runs=runs, alignment=alignment, indent_pt=line.x0))
+            blocks.append(Paragraph(runs=runs, alignment=alignment, indent_pt=line.x0, bbox=line_bbox))
         else:
             last = blocks[-1]
             last.runs.append(Run(text=" " + line.text, size_pt=line.median_size))
+            if last.bbox is not None:
+                last.bbox = BBox(
+                    min(last.bbox.x0, line_bbox.x0),
+                    last.bbox.y0,
+                    max(last.bbox.x1, line_bbox.x1),
+                    line_bbox.y1,
+                )
 
         prev_line = line
 

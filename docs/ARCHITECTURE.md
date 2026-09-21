@@ -3,7 +3,7 @@
 ## 1. Стек
 
 Python 3.11 · PySide6 (GUI) · PyMuPDF + pdfplumber (PDF) · Tesseract 5 / pytesseract (OCR)
-· OpenCV + NumPy + Pillow (обработка изображений) · python-docx (генерация DOCX)
+· OpenCV + NumPy + Pillow (обработка изображений) · img2table (детекция таблиц на сканах) · python-docx (генерация DOCX)
 
 ## 2. Структура каталогов
 
@@ -21,7 +21,7 @@ bes_ocr/
     text_layer.py         оценка качества текстового слоя страницы
     ocr_engine.py          препроцессинг + Tesseract (слова, строки, bbox, confidence)
     layout_analysis.py    сборка слов/строк в параграфы/заголовки/списки
-    table_detection.py    поиск таблиц (pdfplumber и OpenCV-сетка) + объединённые ячейки
+    table_detection.py    поиск таблиц (pdfplumber для текстового слоя, img2table для сканов) + объединённые ячейки
     page_processor.py     обработка одной страницы (оркестрация всех модулей выше)
     pipeline.py           обработка документа целиком: страницы, колонтитулы, сборка Document
     docx_writer.py        генерация .docx из модели Document
@@ -64,7 +64,7 @@ PDF (PyMuPDF)
       2. если слой хороший:  извлечь текст+шрифты (PyMuPDF), таблицы (pdfplumber)
          если слоя нет/плохой: растрировать страницу (DPI по config),
              ocr_engine.recognize() → слова+bbox+confidence,
-             table_detection по сетке линий (OpenCV) на растре
+             table_detection через img2table (см. docs/RESEARCH.md, п.5.1) на растре
       3. layout_analysis: слова/строки → параграфы/заголовки/списки/выравнивание
       4. обнаружение изображений (PyMuPDF: встроенные растры; для сканов —
          страница уже является изображением, поэтому шаг 4 неактуален)

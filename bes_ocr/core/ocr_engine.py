@@ -132,14 +132,6 @@ class OcrEngine:
             )
         return words
 
-    def recognize_cell_text(self, image_bgr: np.ndarray) -> str:
-        """Распознаёт содержимое одной ячейки таблицы (короткий текст)."""
-        image = preprocess_for_ocr(image_bgr)
-        text = pytesseract.image_to_string(
-            image, lang=self.settings.ocr_languages, config="--psm 6"
-        )
-        return text.strip()
-
     def is_likely_handwriting_or_noise(self, words: list[OcrWord]) -> bool:
         """Эвристика п.3 ТЗ: рукописный/нераспознаваемый текст → не плодить мусор."""
         if not words:

@@ -14,7 +14,7 @@ from .layout_analysis import LayoutWord, build_blocks
 from .models import BBox, ImageBlock, Page
 from .ocr_engine import OcrEngine
 from .pdf_source import PdfSource
-from .table_detection import detect_tables_opencv, detect_tables_pdfplumber
+from .table_detection import detect_tables_img2table, detect_tables_pdfplumber
 from .text_layer import assess_text_layer
 
 logger = logging.getLogger("bes_ocr")
@@ -73,13 +73,6 @@ def process_page(
         else:
             image_bgr, zoom = pdf.render_page_image(page_number, dpi=settings.render_dpi)
             px_to_pt = 1.0 / zoom
-            # Слова распознаются на исходном (не повёрнутом) изображении:
-            # поворот через warpAffine (даже INTER_CUBIC) слегка размывает
-            # мелкий текст и заметно портит точность OCR на некрупном шрифте.
-            # Небольшой перекос скана сам Tesseract переносит нормально на
-            # уровне целой страницы. Выравнивание нужно только для поиска
-            # линий таблиц (см. table_detection.detect_tables_opencv) — там
-            # оно выполняется отдельно и только для этой задачи.
             ocr_words = ocr_engine.recognize_words(image_bgr)
 
             if ocr_engine.is_likely_handwriting_or_noise(ocr_words):
@@ -99,14 +92,7 @@ def process_page(
                 logger.info("Страница %d: сохранена как изображение (вероятен рукописный/нераспознаваемый текст)", page_number + 1)
                 return page
 
-            tables_px = detect_tables_opencv(image_bgr, ocr_engine, settings)
-            tables = []
-            for t in tables_px:
-                if t.bbox:
-                    t.bbox = BBox(
-                        t.bbox.x0 * px_to_pt, t.bbox.y0 * px_to_pt, t.bbox.x1 * px_to_pt, t.bbox.y1 * px_to_pt
-                    )
-                tables.append(t)
+            tables = detect_tables_img2table(image_bgr, settings, px_to_pt)
 
             words = [
                 LayoutWord(

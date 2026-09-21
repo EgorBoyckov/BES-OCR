@@ -144,3 +144,28 @@ def test_table_column_widths_written_to_docx(tmp_path):
     reopened = DocxDocument(out_path)
     col_widths = [c.width.pt for c in reopened.tables[0].columns]
     assert col_widths[0] > col_widths[1]
+
+
+def test_table_cell_font_size_matches_run_size_pt(tmp_path):
+    """Регрессия: раньше текст ячеек всегда получал шрифт стиля Word по
+    умолчанию (~11pt) независимо от `Run.size_pt`, из-за чего плотные
+    таблицы реальных бланков (распознанный шрифт которых мельче) переносили
+    заметно больше строк, чем в оригинале, и документ раздувался на лишние
+    страницы (измерено на реальном документе: 2 страницы → 3)."""
+    document = Document()
+    page = Page(number=1, width_pt=595.0, height_pt=842.0)
+    table = Table(col_widths_pt=[200.0])
+    table.rows = [
+        TableRow(cells=[TableCell(blocks=[Paragraph(runs=[Run(text="Small", size_pt=7.0)])])])
+    ]
+    page.blocks.append(table)
+    document.pages.append(page)
+
+    out_path = os.path.join(tmp_path, "cell_font.docx")
+    build_docx(document, out_path)
+
+    reopened = DocxDocument(out_path)
+    # cell.text = "" (см. docx_writer._write_table) уже оставляет один пустой
+    # run в параграфе, наш форматированный текст добавляется следующим.
+    run = reopened.tables[0].cell(0, 0).paragraphs[0].runs[-1]
+    assert run.font.size.pt == 7.0

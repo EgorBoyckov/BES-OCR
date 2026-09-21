@@ -49,8 +49,17 @@ def _round_bbox(bbox, ndigits: int = 1):
     return tuple(round(v, ndigits) for v in bbox)
 
 
-def detect_tables_pdfplumber(pdf_path: str, page_number: int) -> list[Table]:
-    """page_number — 0-based индекс страницы."""
+def detect_tables_pdfplumber(pdf_path: str, page_number: int, font_size_pt: float = 9.0) -> list[Table]:
+    """page_number — 0-based индекс страницы.
+
+    font_size_pt — размер шрифта тела документа (медиана по словам страницы,
+    см. page_processor), применяется к тексту ячеек таблицы. Без этого текст
+    ячеек получал зашитый по умолчанию в модели `Run.size_pt` (11pt), почти
+    всегда крупнее настоящего шрифта плотных таблиц бланков — из-за этого
+    ширина столбцов (взятая из реальной геометрии PDF/скана) не вмещала
+    текст на той же высоте строки, что и в оригинале, и таблица переносила
+    гораздо больше строк, раздувая документ на лишние страницы (измерено на
+    реальном документе: 2 страницы оригинала → 3 страницы результата)."""
     tables: list[Table] = []
     with pdfplumber.open(pdf_path) as pdf:
         page = pdf.pages[page_number]
@@ -121,7 +130,7 @@ def detect_tables_pdfplumber(pdf_path: str, page_number: int) -> list[Table]:
                     text = ""
                     if r < len(text_matrix) and c < len(text_matrix[r]):
                         text = (text_matrix[r][c] or "").strip()
-                    para = Paragraph(runs=[Run(text=text)]) if text else Paragraph(runs=[Run(text="")])
+                    para = Paragraph(runs=[Run(text=text, size_pt=font_size_pt)])
                     row_obj.cells.append(TableCell(blocks=[para], row_span=row_span, col_span=col_span))
                 table.rows.append(row_obj)
             table.col_widths_pt = _column_widths_from_spans(grid_bbox, spans, n_cols)
@@ -149,13 +158,17 @@ def _column_widths_from_spans(
     return [w if w > 0 else 50.0 for w in widths]
 
 
-def detect_tables_img2table(image_bgr, settings: Settings, px_to_pt: float) -> list[Table]:
+def detect_tables_img2table(
+    image_bgr, settings: Settings, px_to_pt: float, font_size_pt: float = 9.0
+) -> list[Table]:
     """Обнаруживает таблицы на растре скана через img2table + Tesseract.
 
     image_bgr — уже отрендеренная страница (см. page_processor), px_to_pt —
     коэффициент перевода пиксельных координат рендера в точки PDF (для
     единообразия с координатами слов текстового слоя/OCR на этой же
-    странице, см. page_processor._filter_words_outside_tables).
+    странице, см. page_processor._filter_words_outside_tables). font_size_pt —
+    см. detect_tables_pdfplumber — та же проблема раздувания страниц лишними
+    переносами актуальна и для сканов.
     """
     import cv2
 
@@ -182,13 +195,13 @@ def detect_tables_img2table(image_bgr, settings: Settings, px_to_pt: float) -> l
 
     tables: list[Table] = []
     for et in extracted:
-        table = _convert_img2table(et, px_to_pt)
+        table = _convert_img2table(et, px_to_pt, font_size_pt)
         if table is not None:
             tables.append(table)
     return tables
 
 
-def _convert_img2table(extracted_table, px_to_pt: float) -> Table | None:
+def _convert_img2table(extracted_table, px_to_pt: float, font_size_pt: float = 9.0) -> Table | None:
     rows = list(extracted_table.content.values())
     if not rows:
         return None
@@ -230,7 +243,7 @@ def _convert_img2table(extracted_table, px_to_pt: float) -> Table | None:
                 continue
             row_span, col_span = spans.get((r, c), (1, 1))
             text = (cell.value or "").strip()
-            para = Paragraph(runs=[Run(text=text)])
+            para = Paragraph(runs=[Run(text=text, size_pt=font_size_pt)])
             cb = cell.bbox
             row_obj.cells.append(
                 TableCell(

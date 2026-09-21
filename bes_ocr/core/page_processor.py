@@ -7,6 +7,7 @@ PageProcessingError, чтобы ошибка одной страницы не р
 from __future__ import annotations
 
 import logging
+import statistics
 import time
 
 from ..config.settings import Settings
@@ -56,8 +57,16 @@ def process_page(
         noise_blocks: list[tuple[float, ImageBlock]] = []
 
         if assessment.usable:
-            tables = detect_tables_pdfplumber(pdf_path, page_number)
             raw_words = pdf.extract_text_words(page_number)
+            # Медианный размер шрифта тела документа передаётся в детектор
+            # таблиц: текст ячеек по умолчанию не несёт информации о размере
+            # шрифта (см. table_detection.py), а фиксированный запасной
+            # размер модели (11pt) почти всегда крупнее реального шрифта
+            # плотных таблиц бланков, из-за чего таблица переносит больше
+            # строк, чем в оригинале, и документ раздувается лишними
+            # страницами.
+            body_font_size = statistics.median([w.font_size for w in raw_words]) if raw_words else 9.0
+            tables = detect_tables_pdfplumber(pdf_path, page_number, font_size_pt=body_font_size)
             words = [
                 LayoutWord(
                     text=w.text,
@@ -95,7 +104,13 @@ def process_page(
                 logger.info("Страница %d: сохранена как изображение (вероятен рукописный/нераспознаваемый текст)", page_number + 1)
                 return page
 
-            tables = detect_tables_img2table(image_bgr, settings, px_to_pt)
+            confident_words = [w for w in ocr_words if w.confidence >= settings.ocr_word_confidence_threshold]
+            body_font_size = (
+                statistics.median([max(6.0, (w.y1 - w.y0) * px_to_pt * 0.8) for w in confident_words])
+                if confident_words
+                else 9.0
+            )
+            tables = detect_tables_img2table(image_bgr, settings, px_to_pt, font_size_pt=body_font_size)
 
             img_h, img_w = image_bgr.shape[:2]
             table_bboxes_px = [

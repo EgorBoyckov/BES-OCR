@@ -184,9 +184,20 @@ def _write_table(doc: DocxDocument, table: Table, geometry: PageGeometry) -> Non
             docx_cell.text = ""
             docx_cell.width = Pt(col_widths_pt[c])
             para = docx_cell.paragraphs[0]
+            # Размер шрифта ячейки берём из первого run текста ячейки, а не
+            # оставляем стиль Word по умолчанию (обычно 11pt) — иначе текст,
+            # который распознан в реальном, часто мелком шрифте плотной
+            # таблицы, переносится в DOCX гораздо крупнее оригинала и
+            # раздувает высоту строк (и, как следствие, число страниц).
+            cell_size_pt = 9.0
+            for block in cell.blocks:
+                if isinstance(block, Paragraph) and block.runs:
+                    cell_size_pt = block.runs[0].size_pt
+                    break
             text = cell.text
             if text:
-                para.add_run(text)
+                run = para.add_run(text)
+                run.font.size = Pt(max(6.0, min(cell_size_pt, 20.0)))
 
     for r0, c0, r1, c1 in merges:
         try:

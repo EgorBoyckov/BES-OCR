@@ -7,6 +7,7 @@ PageProcessingError, чтобы ошибка одной страницы не р
 from __future__ import annotations
 
 import logging
+import time
 
 from ..config.settings import Settings
 from .errors import PageProcessingError
@@ -46,6 +47,7 @@ def process_page(
     ocr_engine: OcrEngine,
 ) -> Page:
     """page_number — 0-based индекс."""
+    start_time = time.monotonic()
     try:
         width_pt, height_pt = pdf.page_size_pt(page_number)
         page = Page(number=page_number + 1, width_pt=width_pt, height_pt=height_pt)
@@ -196,6 +198,19 @@ def process_page(
 
         ordered.sort(key=lambda item: item[0])
         page.blocks = [b for _, b in ordered]
+
+        n_tables = sum(1 for b in page.blocks if hasattr(b, "n_rows"))
+        n_images = sum(1 for b in page.blocks if isinstance(b, ImageBlock))
+        source = "OCR (скан)" if page.used_ocr else "текстовый слой"
+        logger.info(
+            "Страница %d: источник — %s, блоков: %d (таблиц: %d, изображений: %d), %.1f с",
+            page_number + 1,
+            source,
+            len(page.blocks),
+            n_tables,
+            n_images,
+            time.monotonic() - start_time,
+        )
         return page
     except Exception as exc:  # noqa: BLE001
         raise PageProcessingError(page_number + 1, str(exc)) from exc

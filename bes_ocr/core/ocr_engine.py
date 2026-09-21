@@ -75,11 +75,21 @@ def deskew(image_bgr: np.ndarray) -> np.ndarray:
 
 
 def binarize(image_bgr: np.ndarray) -> np.ndarray:
+    """Бинаризация перед OCR.
+
+    Раньше здесь был `fastNlMeansDenoising` + `adaptiveThreshold` (локальный
+    порог) — рассчитано на неровное освещение (тени, блики), но на
+    реальном документе (плоский планшетный скан) заметно проигрывало
+    простому глобальному порогу Отсу: ниже средняя уверенность Tesseract
+    (82.8 против 87.6 на "трудной" странице), и предлог "от" распознавался
+    как "OT" (заглавные латинские) вместо корректного "от" — измерено
+    напрямую на реальном сканированном документе проекта. Оставлен лёгкий
+    `GaussianBlur` вместо тяжёлого `fastNlMeansDenoising` — сглаживает
+    шум скана почти без потери резкости краёв символов и заметно быстрее.
+    """
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.fastNlMeansDenoising(gray, h=7)
-    thresh = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 15
-    )
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return thresh
 
 

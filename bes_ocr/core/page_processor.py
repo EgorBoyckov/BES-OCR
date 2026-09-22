@@ -343,7 +343,9 @@ def process_page(
         bounds = None
         if text_words:
             bounds = content_bounds(words_to_lines(text_words), width_pt)
-        text_blocks = build_blocks(text_words, width_pt, height_pt, bounds=bounds, fit_spacing=page.used_ocr)
+        text_blocks = build_blocks(
+            text_words, width_pt, height_pt, bounds=bounds, fit_spacing=page.used_ocr, drop_symbol_lines=page.used_ocr
+        )
 
         ordered: list[tuple[float, object]] = []
         for b in text_blocks:

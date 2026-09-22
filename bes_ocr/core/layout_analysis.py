@@ -234,8 +234,11 @@ def normalize_ocr_words(words: list[LayoutWord], default_size: float = 11.0) -> 
         if size is not None:
             raw_size[i] = size
             line_weight[i] = sum(len(w.text) for w in line.words)
-        strokes = [w.stroke_pt for w in line.words if w.stroke_pt]
-        stroke_ratio[i] = (statistics.median(strokes) / size) if strokes and size else None
+        # Толщина штриха строки — по буквам: у цифр и знаков (особенно "1")
+        # штрих заметно толще, и в короткой строке они искажали бы оценку.
+        strokes = [(w.stroke_pt, sum(ch.isalpha() for ch in w.text) or 0.3) for w in line.words if w.stroke_pt]
+        stroke = _weighted_median(strokes)
+        stroke_ratio[i] = (stroke / size) if stroke and size else None
 
     # Полужирность: сравниваем толщину штриха строки с типичной для строк
     # близкого кегля (у мелкого текста относительная толщина на скане всегда
@@ -323,6 +326,11 @@ def _word_width(w: LayoutWord) -> float:
 
 
 def _is_list_start(line: LayoutLine) -> Optional[tuple[re.Match, bool]]:
+    # Маркер пункта списка стоит рядом с текстом пункта; "—" или "1." далеко
+    # слева от остального текста строки — это другое (строка подписи,
+    # номер в графе и т.п.).
+    if len(line.words) >= 2 and line.words[1].x0 - line.words[0].x1 > 3.0 * line.size:
+        return None
     text = line.text.strip()
     m = _ORDERED_RE.match(text)
     if m:
@@ -759,6 +767,18 @@ def _evaluate_band(lines, i, j, intervals, x_left, x_right) -> Optional[_ColumnB
         le_aligned = sum(1 for v in left_ends if abs(v - le_med) <= tol) >= 0.6 * len(two_sided)
         if not (rs_aligned or le_aligned):
             continue
+        # Границы полосы — по строкам, которые действительно "опираются" на
+        # коридор (правая часть начинается от него или левая заканчивается
+        # у него). Строка обычного абзаца, у которой растянутый пробел
+        # случайно совпал с коридором, в полосу не попадает.
+        consistent = [
+            k
+            for (k, _, _), rs, le in zip(two_sided, right_starts, left_ends)
+            if (rs_aligned and abs(rs - rs_med) <= tol) or (le_aligned and abs(le - le_med) <= tol)
+        ]
+        if len(consistent) < 3:
+            continue
+        start, end = consistent[0], consistent[-1]
         cand = _ColumnBand(start, end, g0, g1)
         if best is None or (cand.end - cand.start) > (best.end - best.start):
             best = cand
@@ -831,10 +851,18 @@ def build_blocks(
     bounds: Optional[tuple[float, float]] = None,
     detect_columns: bool = True,
     fit_spacing: bool = False,
+    drop_symbol_lines: bool = False,
 ) -> list[object]:
     """Основная функция: слова страницы → список Block (Heading/Paragraph/
     ListItem, а для двухколоночных фрагментов — Table(borderless=True))."""
     lines = words_to_lines(words)
+    if drop_symbol_lines:
+        # Строки из одного-двух знаков без букв и цифр ("—", ".") на скане —
+        # обрывки линий и штрихов, а не текст.
+        lines = [
+            ln for ln in lines
+            if any(ch.isalnum() for ch in ln.text) or len(ln.text.replace(" ", "")) > 3
+        ]
     if not lines:
         return []
 

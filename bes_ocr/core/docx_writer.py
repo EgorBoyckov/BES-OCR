@@ -124,12 +124,15 @@ def clean_font_name(raw: Optional[str]) -> Optional[str]:
     if not raw:
         return None
     name = raw.split("+", 1)[-1]
+    full_key = re.sub(r"[\s_,-]", "", name).lower()
+    # Сначала — известные семейства по префиксу (у "TimesNewRoman" слово
+    # "Roman" — часть имени, а не начертание).
+    for key in sorted(_KNOWN_FONTS, key=len, reverse=True):
+        if full_key.startswith(key):
+            return _KNOWN_FONTS[key]
     name = _FONT_SUFFIX_RE.sub("", name).strip(" ,-")
     if not name:
         return None
-    key = re.sub(r"[\s_-]", "", name).lower()
-    if key in _KNOWN_FONTS:
-        return _KNOWN_FONTS[key]
     # "TimesNewRoman" → "Times New Roman"
     spaced = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", name)
     return spaced

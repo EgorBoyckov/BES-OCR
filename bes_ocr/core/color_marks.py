@@ -113,12 +113,15 @@ def extract_color_marks(
         x0, y0 = max(0, x - pad), max(0, y - pad)
         x1, y1 = min(w_img, x + w + pad), min(h_img, y + h + pad)
         crop = image_bgr[y0:y1, x0:x1]
-        # Внутри найденной области берём мягкую маску, ограниченную
-        # окрестностью строгих штрихов этой отметки.
+        # Мягкая маска (бледные края оттиска, тёмные участки подписи) — только
+        # рядом со штрихами самой отметки: иначе стирался бы чёрный текст под
+        # печатью, который на скане тоже приобретает синеватый оттенок.
+        # Плюс все насыщенно-цветные пиксели внутри рамки: текст в центре
+        # оттиска часто отделён от кольца и сам по себе мал для порога.
         near = np.zeros(mask.shape, np.uint8)
         near[y : y + h, x : x + w] = ink
         near = cv2.dilate(near[y0:y1, x0:x1], np.ones((join, join), np.uint8))
-        comp_mask = _ink_mask(crop, loose=True) & near
+        comp_mask = (_ink_mask(crop, loose=True) & near) | mask[y0:y1, x0:x1]
         # Мягкая альфа: полностью непрозрачные штрихи, полупрозрачный
         # край — без "ореола" от фона бумаги.
         alpha = cv2.GaussianBlur(cv2.dilate(comp_mask, np.ones((2, 2), np.uint8)), (3, 3), 0)

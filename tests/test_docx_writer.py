@@ -196,3 +196,24 @@ def test_nested_list_items_get_distinct_docx_styles(tmp_path):
     reopened = DocxDocument(out_path)
     styles = [p.style.name for p in reopened.paragraphs if p.text in ("Top", "Nested")]
     assert styles == ["List Number", "List Number 2"]
+
+
+def test_paragraph_space_before_pt_applied_and_defaults_overridden(tmp_path):
+    """Регрессия: раньше `space_before_pt` не читался при записи DOCX, и
+    каждый абзац получал жёстко зашитый в шаблон Word отступ (space after
+    10pt + межстрочный множитель 1.15×) независимо от исходной плотности
+    текста — систематически раздувало документ (см. docs/ARCHITECTURE.md,
+    раздел 10)."""
+    document = Document()
+    page = Page(number=1, width_pt=595.0, height_pt=842.0)
+    page.blocks.append(Paragraph(runs=[Run(text="Spaced")], space_before_pt=42.0))
+    document.pages.append(page)
+
+    out_path = os.path.join(tmp_path, "spacing.docx")
+    build_docx(document, out_path)
+
+    reopened = DocxDocument(out_path)
+    para = next(p for p in reopened.paragraphs if p.text == "Spaced")
+    assert para.paragraph_format.space_before.pt == 42.0
+    assert para.paragraph_format.space_after.pt == 0.0
+    assert para.paragraph_format.line_spacing == 1.0

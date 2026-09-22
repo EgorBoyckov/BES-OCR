@@ -165,9 +165,26 @@ def build_blocks(
 
         line_bbox = BBox(line.x0, line.y0, line.x1, line.y1)
 
+        # Реальный зазор перед новым блоком (п.7.2 ТЗ scan2docx-inspired
+        # "text fit"): DOCX по умолчанию (шаблон python-docx/Word) добавляет
+        # своё собственное фиксированное "space after" (10pt) и межстрочный
+        # множитель 1.15× для КАЖДОГО абзаца — независимо от того, насколько
+        # плотно или свободно расположены строки в оригинале. На плотных
+        # бланках/таблицах это накапливается и раздувает документ на лишние
+        # страницы точно так же, как раздувал неверный размер шрифта ячеек
+        # таблицы (см. table_detection.py); здесь та же проблема, но для
+        # обычного текста — раньше `space_before_pt` в модели существовал,
+        # но нигде не заполнялся и не читался.
+        block_space_before = max(0.0, gap) if new_paragraph else 0.0
+
         if is_heading:
             level = 1 if line.median_size > body_size * 1.45 else 2
-            blocks.append(Heading(runs=runs, alignment=alignment, level=level, bbox=line_bbox))
+            blocks.append(
+                Heading(
+                    runs=runs, alignment=alignment, level=level, bbox=line_bbox,
+                    space_before_pt=block_space_before,
+                )
+            )
         elif ordered_match or bullet_match:
             marker = ordered_match.group(0).strip() if ordered_match else bullet_match.group(0).strip()
             clean_text = text[len(ordered_match.group(0)) :] if ordered_match else text[len(bullet_match.group(0)) :]
@@ -186,10 +203,16 @@ def build_blocks(
                     indent_pt=line.x0,
                     level=level,
                     bbox=line_bbox,
+                    space_before_pt=block_space_before,
                 )
             )
         elif new_paragraph or not blocks or not isinstance(blocks[-1], Paragraph) or isinstance(blocks[-1], (Heading, ListItem)):
-            blocks.append(Paragraph(runs=runs, alignment=alignment, indent_pt=line.x0, bbox=line_bbox))
+            blocks.append(
+                Paragraph(
+                    runs=runs, alignment=alignment, indent_pt=line.x0, bbox=line_bbox,
+                    space_before_pt=block_space_before,
+                )
+            )
         else:
             last = blocks[-1]
             last.runs.append(Run(text=" " + line.text, size_pt=line.median_size))

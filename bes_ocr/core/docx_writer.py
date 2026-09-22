@@ -16,7 +16,7 @@ import logging
 import statistics
 
 from docx import Document as DocxDocument
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
 from docx.oxml.ns import qn
 from docx.shared import Pt
 from PIL import Image as PILImage
@@ -151,6 +151,21 @@ def _write_paragraph(doc: DocxDocument, block: Paragraph, geometry: PageGeometry
     extra_indent = block.indent_pt - geometry.margin_left_pt
     if extra_indent > 3.0:
         p.paragraph_format.left_indent = Pt(min(extra_indent, geometry.usable_width_pt * 0.6))
+    # Шаблон python-docx/Word по умолчанию даёт КАЖДОМУ абзацу свои
+    # "space after" (10pt) и межстрочный множитель 1.15× (см. docDefaults в
+    # styles.xml) — независимо от плотности исходного документа. Это
+    # систематически раздувает результат сверх того, что даёт сам размер
+    # шрифта (тот же класс проблемы, что и раздувание таблиц из-за размера
+    # шрифта ячеек, см. table_detection.py). Вместо этого используем
+    # реальный измеренный зазор перед блоком (`space_before_pt`, из
+    # вертикального расстояния между строками в оригинале) и одинарный
+    # интервал, без автоматического "space after".
+    p.paragraph_format.space_after = Pt(0)
+    p.paragraph_format.line_spacing_rule = WD_LINE_SPACING.SINGLE
+    if block.space_before_pt > 0.5:
+        p.paragraph_format.space_before = Pt(min(block.space_before_pt, 200.0))
+    else:
+        p.paragraph_format.space_before = Pt(0)
     for run_data in block.runs:
         if not run_data.text:
             continue

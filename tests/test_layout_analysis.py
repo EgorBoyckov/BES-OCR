@@ -51,3 +51,23 @@ def test_nested_list_levels_from_indent():
 
     list_items = [b for b in blocks if isinstance(b, ListItem)]
     assert [li.level for li in list_items] == [0, 1, 1, 0]
+
+
+def test_paragraph_space_before_reflects_real_gap():
+    """Регрессия: `Paragraph.space_before_pt` раньше существовал в модели,
+    но build_blocks никогда его не заполнял — DOCX-рендерер получал везде
+    0 и полагался на жёстко зашитый в шаблон Word отступ (10pt + 1.15×),
+    независимо от того, насколько плотно расположен текст в оригинале."""
+    words = [
+        LayoutWord(text="First", x0=40, y0=40, x1=90, y1=52, size_pt=11),
+        LayoutWord(text="paragraph.", x0=95, y0=40, x1=160, y1=52, size_pt=11),
+        # Большой разрыв (98pt) перед следующим абзацем — явно больше, чем
+        # обычный межстрочный интервал.
+        LayoutWord(text="Second", x0=40, y0=150, x1=95, y1=162, size_pt=11),
+        LayoutWord(text="paragraph.", x0=100, y0=150, x1=165, y1=162, size_pt=11),
+    ]
+    blocks = build_blocks(words, page_width=595, page_height=842)
+    paragraphs = [b for b in blocks if isinstance(b, Paragraph)]
+    assert len(paragraphs) == 2
+    assert paragraphs[0].space_before_pt == 0.0  # первый блок на странице
+    assert paragraphs[1].space_before_pt == 98.0  # 150 - 52

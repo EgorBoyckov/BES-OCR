@@ -27,3 +27,27 @@ def test_bullet_list_detected():
     blocks = build_blocks(words, page_width=595, page_height=842)
     assert isinstance(blocks[0], ListItem)
     assert not blocks[0].ordered
+
+
+def _list_line(marker: str, text: str, x0: float, y0: float) -> list[LayoutWord]:
+    words = [marker] + text.split()
+    return [
+        LayoutWord(text=w, x0=x0 + i * 30, y0=y0, x1=x0 + i * 30 + 20, y1=y0 + 12, size_pt=11)
+        for i, w in enumerate(words)
+    ]
+
+
+def test_nested_list_levels_from_indent():
+    """Уровень вложенности пункта списка определяется по относительному
+    отступу (indent_pt), а не всегда 0 — иначе вложенные списки в DOCX
+    визуально неотличимы от списка без вложенности (п.4 ТЗ: сохранять
+    структуру списков)."""
+    words: list[LayoutWord] = []
+    words += _list_line("1.", "Top level one", x0=40, y0=40)
+    words += _list_line("-", "Nested bullet", x0=70, y0=60)
+    words += _list_line("-", "Nested bullet two", x0=70, y0=80)
+    words += _list_line("2.", "Top level two", x0=40, y0=100)
+    blocks = build_blocks(words, page_width=595, page_height=842)
+
+    list_items = [b for b in blocks if isinstance(b, ListItem)]
+    assert [li.level for li in list_items] == [0, 1, 1, 0]

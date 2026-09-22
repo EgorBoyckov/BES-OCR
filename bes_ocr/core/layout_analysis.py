@@ -135,6 +135,14 @@ def build_blocks(
     body_size = statistics.median([ln.median_size for ln in (multi_word_lines or lines)])
     blocks: list[object] = []
     prev_line: LayoutLine | None = None
+    # Стек отступов вложенных списков (п.4 ТЗ: сохранять уровни списка, а не
+    # только сам факт "это список"): маркированные/нумерованные строки идут
+    # в документе не помеченными уровнем — глубина вложенности определяется
+    # только относительным отступом (line.x0) соседних пунктов списка.
+    # Допуск в 8pt отсеивает дрожание OCR-координат внутри одного уровня, не
+    # давая ему ошибочно создать лишний уровень вложенности.
+    list_indent_stack: list[float] = []
+    _LIST_INDENT_TOLERANCE = 8.0
 
     for line in lines:
         gap = (line.y0 - prev_line.y1) if prev_line else 0.0
@@ -164,6 +172,11 @@ def build_blocks(
             marker = ordered_match.group(0).strip() if ordered_match else bullet_match.group(0).strip()
             clean_text = text[len(ordered_match.group(0)) :] if ordered_match else text[len(bullet_match.group(0)) :]
             item_runs = [Run(text=clean_text, size_pt=line.median_size)]
+            while list_indent_stack and line.x0 < list_indent_stack[-1] - _LIST_INDENT_TOLERANCE:
+                list_indent_stack.pop()
+            if not list_indent_stack or line.x0 > list_indent_stack[-1] + _LIST_INDENT_TOLERANCE:
+                list_indent_stack.append(line.x0)
+            level = len(list_indent_stack) - 1
             blocks.append(
                 ListItem(
                     runs=item_runs,
@@ -171,6 +184,7 @@ def build_blocks(
                     ordered=bool(ordered_match),
                     marker=marker,
                     indent_pt=line.x0,
+                    level=level,
                     bbox=line_bbox,
                 )
             )

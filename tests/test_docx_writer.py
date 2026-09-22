@@ -5,6 +5,7 @@ from docx import Document as DocxDocument
 from bes_ocr.core.docx_writer import (
     _compute_page_geometry,
     _fitted_column_widths,
+    _list_style,
     build_docx,
 )
 from bes_ocr.core.models import (
@@ -12,6 +13,7 @@ from bes_ocr.core.models import (
     Document,
     Heading,
     ImageBlock,
+    ListItem,
     Page,
     Paragraph,
     Run,
@@ -169,3 +171,28 @@ def test_table_cell_font_size_matches_run_size_pt(tmp_path):
     # run в параграфе, наш форматированный текст добавляется следующим.
     run = reopened.tables[0].cell(0, 0).paragraphs[0].runs[-1]
     assert run.font.size.pt == 7.0
+
+
+def test_list_style_picks_nested_style_by_level():
+    assert _list_style(ListItem(ordered=True, level=0)) == "List Number"
+    assert _list_style(ListItem(ordered=True, level=1)) == "List Number 2"
+    assert _list_style(ListItem(ordered=True, level=2)) == "List Number 3"
+    # За пределами глубины, предусмотренной шаблоном Word, остаёмся на
+    # самом глубоком доступном стиле, а не падаем/выходим за границы списка.
+    assert _list_style(ListItem(ordered=True, level=5)) == "List Number 3"
+    assert _list_style(ListItem(ordered=False, level=1)) == "List Bullet 2"
+
+
+def test_nested_list_items_get_distinct_docx_styles(tmp_path):
+    document = Document()
+    page = Page(number=1, width_pt=595.0, height_pt=842.0)
+    page.blocks.append(ListItem(runs=[Run(text="Top")], ordered=True, level=0))
+    page.blocks.append(ListItem(runs=[Run(text="Nested")], ordered=True, level=1))
+    document.pages.append(page)
+
+    out_path = os.path.join(tmp_path, "nested_list.docx")
+    build_docx(document, out_path)
+
+    reopened = DocxDocument(out_path)
+    styles = [p.style.name for p in reopened.paragraphs if p.text in ("Top", "Nested")]
+    assert styles == ["List Number", "List Number 2"]

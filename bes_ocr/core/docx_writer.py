@@ -259,6 +259,23 @@ def _write_image(doc: DocxDocument, block: ImageBlock, geometry: PageGeometry) -
         run.font.size = Pt(9)
 
 
+# Стандартный шаблон Word (тот, что использует python-docx по умолчанию)
+# не даёт единого многоуровневого списка через один стиль — вместо этого
+# для второго/третьего уровня вложенности есть отдельные стили с уже
+# готовой (более глубокой) нумерацией/отступом ("List Number 2/3",
+# "List Bullet 2/3"). Больше трёх уровней в исходном шаблоне не
+# предусмотрено — упираемся в третий и полагаемся на left_indent
+# (см. _write_paragraph) для более глубокой вложенности.
+_LIST_STYLES_ORDERED = ["List Number", "List Number 2", "List Number 3"]
+_LIST_STYLES_BULLET = ["List Bullet", "List Bullet 2", "List Bullet 3"]
+
+
+def _list_style(block: ListItem) -> str:
+    styles = _LIST_STYLES_ORDERED if block.ordered else _LIST_STYLES_BULLET
+    idx = min(max(block.level, 0), len(styles) - 1)
+    return styles[idx]
+
+
 def build_docx(document: Document, output_path: str) -> None:
     try:
         doc = DocxDocument()
@@ -289,7 +306,7 @@ def build_docx(document: Document, output_path: str) -> None:
                     style = f"Heading {min(max(block.level, 1), 4)}"
                     _write_paragraph(doc, block, geometry, style=style)
                 elif isinstance(block, ListItem):
-                    style = "List Number" if block.ordered else "List Bullet"
+                    style = _list_style(block)
                     _write_paragraph(doc, block, geometry, style=style)
                 elif isinstance(block, Table):
                     _write_table(doc, block, geometry)

@@ -105,13 +105,21 @@ def russian_scanned_pdf(fixtures_dir) -> str:
     draw.text((80, 80), "Тестовый документ на русском языке", font=font, fill="black")
     draw.text((80, 160), "Это простой абзац текста для проверки OCR распознавания.", font=font_small, fill="black")
 
-    x0, y0, col_w, row_h, n_cols, n_rows = 80, 400, 300, 80, 3, 3
+    # Ячейки заполнены словами разумной длины (не однословными обрывками):
+    # у img2table калибровка типичного размера символа и межстрочного
+    # интервала строится по статистике реального текста на странице —
+    # таблица из одних коротких 3-4-буквенных слов даёт слишком мало данных
+    # для калибровки и распознаётся ненадёжно даже при чёткой сетке линий.
+    x0, y0, col_w, row_h, n_cols, n_rows = 80, 400, 320, 110, 3, 3
     _draw_grid(draw, x0, y0, n_rows, n_cols, col_w, row_h, skip_v_in_row=0)
-    draw.text((x0 + 10, y0 + 20), "Заголовок таблицы", font=font_small, fill="black")
-    data = [["Один", "Два", "Три"], ["Four", "Five", "Six"]]
+    draw.text((x0 + 10, y0 + 40), "Заголовок таблицы на всю ширину", font=font_small, fill="black")
+    data = [
+        ["Иванов Иван", "Инженер отдела", "Первое значение"],
+        ["Петров Пётр", "Ведущий специалист", "Второе значение"],
+    ]
     for r in range(2):
         for c in range(3):
-            draw.text((x0 + c * col_w + 10, y0 + (r + 1) * row_h + 20), data[r][c], font=font_small, fill="black")
+            draw.text((x0 + c * col_w + 10, y0 + (r + 1) * row_h + 15), data[r][c], font=font_small, fill="black")
 
     _image_pdf_from_pil(img, path)
     return path

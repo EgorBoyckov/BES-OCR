@@ -75,11 +75,21 @@ def deskew(image_bgr: np.ndarray) -> np.ndarray:
 
 
 def binarize(image_bgr: np.ndarray) -> np.ndarray:
+    """Бинаризация перед OCR.
+
+    Раньше здесь был `fastNlMeansDenoising` + `adaptiveThreshold` (локальный
+    порог) — рассчитано на неровное освещение (тени, блики), но на
+    реальном документе (плоский планшетный скан) заметно проигрывало
+    простому глобальному порогу Отсу: ниже средняя уверенность Tesseract
+    (82.8 против 87.6 на "трудной" странице), и предлог "от" распознавался
+    как "OT" (заглавные латинские) вместо корректного "от" — измерено
+    напрямую на реальном сканированном документе проекта. Оставлен лёгкий
+    `GaussianBlur` вместо тяжёлого `fastNlMeansDenoising` — сглаживает
+    шум скана почти без потери резкости краёв символов и заметно быстрее.
+    """
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.fastNlMeansDenoising(gray, h=7)
-    thresh = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 15
-    )
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return thresh
 
 
@@ -132,14 +142,6 @@ class OcrEngine:
             )
         return words
 
-    def recognize_cell_text(self, image_bgr: np.ndarray) -> str:
-        """Распознаёт содержимое одной ячейки таблицы (короткий текст)."""
-        image = preprocess_for_ocr(image_bgr)
-        text = pytesseract.image_to_string(
-            image, lang=self.settings.ocr_languages, config="--psm 6"
-        )
-        return text.strip()
-
     def is_likely_handwriting_or_noise(self, words: list[OcrWord]) -> bool:
         """Эвристика п.3 ТЗ: рукописный/нераспознаваемый текст → не плодить мусор."""
         if not words:
@@ -147,3 +149,78 @@ class OcrEngine:
         low_conf = [w for w in words if w.confidence < self.settings.handwriting_confidence_threshold]
         ratio = len(low_conf) / len(words)
         return ratio >= self.settings.handwriting_garbage_word_ratio
+
+
+def _cluster_words_by_proximity(words: list[OcrWord], gap: float) -> list[list[OcrWord]]:
+    """Группирует слова по близости bbox (union-find на пересечении
+    расширенных на gap прямоугольников). Использовано для поиска локальных
+    "пятен визуального шума" (подписи, печати) — п.3 ТЗ: результат должен
+    оставаться локальным (одна строка/несколько соседних слов), поэтому gap
+    заведомо меньше типичного межабзацного отступа."""
+    n = len(words)
+    if n == 0:
+        return []
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    boxes = [(w.x0 - gap, w.y0 - gap, w.x1 + gap, w.y1 + gap) for w in words]
+    for i in range(n):
+        ax0, ay0, ax1, ay1 = boxes[i]
+        for j in range(i + 1, n):
+            bx0, by0, bx1, by1 = boxes[j]
+            if ax0 < bx1 and bx0 < ax1 and ay0 < by1 and by0 < ay1:
+                union(i, j)
+
+    groups: dict[int, list[OcrWord]] = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(words[i])
+    return list(groups.values())
+
+
+def find_noise_regions(
+    words: list[OcrWord], settings: Settings, page_width: float, page_height: float
+) -> list[tuple[float, float, float, float]]:
+    """Находит локальные области скана, похожие на подпись/печать/помарку,
+    а не на печатный текст — п.3 ТЗ требует сохранять такие участки как
+    изображение, а не порождать поток ошибочных символов.
+
+    Важное наблюдение с реального документа: доверие (confidence) отдельного
+    слова здесь ненадёжно само по себе — Tesseract часто уверенно (60-90%)
+    "читает" мусорные штрихи росчерка подписи как короткие псевдослова
+    вперемешку с настоящим напечатанным текстом той же строки (ФИО
+    подписанта), поэтому пороговая фильтрация по confidence одного слова
+    такую область не находит. Вместо этого ищем плотные локальные скопления
+    коротких/невнятных слов: печатный текст почти всегда состоит из слов
+    нормальной длины, а печать/подпись — из обрывков.
+    """
+    clusters = _cluster_words_by_proximity(words, gap=5.0)
+    page_area = max(page_width * page_height, 1.0)
+    regions: list[tuple[float, float, float, float]] = []
+    for cluster in clusters:
+        if len(cluster) < 6:
+            continue
+        suspect = [
+            w
+            for w in cluster
+            if w.confidence < 60.0 or (len(w.text.strip()) <= 2 and w.confidence < 85.0)
+        ]
+        if len(suspect) / len(cluster) < 0.4:
+            continue
+        x0 = min(w.x0 for w in cluster)
+        y0 = min(w.y0 for w in cluster)
+        x1 = max(w.x1 for w in cluster)
+        y1 = max(w.y1 for w in cluster)
+        if (x1 - x0) * (y1 - y0) > 0.05 * page_area:
+            continue  # похоже на обычный плотный абзац текста, а не на пятно шума
+        regions.append((x0, y0, x1, y1))
+    return regions

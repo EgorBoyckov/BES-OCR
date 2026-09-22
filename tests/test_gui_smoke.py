@@ -48,8 +48,19 @@ def test_convert_button_requires_files(qapp, monkeypatch):
     assert window.worker is None
 
 
-def test_full_conversion_via_worker(qapp, text_pdf, tmp_path):
+def test_full_conversion_via_worker(qapp, text_pdf, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
     from bes_ocr.gui.main_window import MainWindow
+    from bes_ocr.gui.widgets import FileStatus
+
+    # _on_all_done показывает модальный QMessageBox — в headless-тесте без
+    # взаимодействия пользователя это блокирует поток навсегда (у самого
+    # диалога свой вложенный event loop, который наш processEvents() не
+    # прерывает). В реальном приложении это нормально (пользователь
+    # нажимает «ОК»), здесь просто убеждаемся, что диалог был бы показан.
+    shown = []
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: shown.append(a))
 
     window = MainWindow()
     window._add_files([text_pdf])
@@ -65,5 +76,64 @@ def test_full_conversion_via_worker(qapp, text_pdf, tmp_path):
         time.sleep(0.05)
 
     assert not window.worker.isRunning()
+    # QThread.isRunning() становится False сразу после выхода из run(), но
+    # поставленные в очередь сигналы (file_done/all_done) в GUI-поток могут
+    # быть ещё не обработаны — дадим циклу событий добрать их.
+    for _ in range(20):
+        QCoreApplication.processEvents()
+        time.sleep(0.02)
+
     produced = list(tmp_path.glob("*.docx"))
     assert len(produced) == 1
+    assert window.file_list.status_of(text_pdf) == FileStatus.DONE
+    assert shown  # сводка "Готово" была бы показана пользователю
+
+
+def test_file_list_widget_status_transitions(qapp):
+    from bes_ocr.gui.widgets import FileListWidget, FileStatus
+
+    widget = FileListWidget()
+    widget.add_file("/tmp/a.pdf", "a.pdf")
+    assert widget.status_of("/tmp/a.pdf") == FileStatus.PENDING
+
+    widget.set_status("/tmp/a.pdf", "a.pdf", FileStatus.DONE, "1.2 с, таблиц: 2")
+    assert widget.status_of("/tmp/a.pdf") == FileStatus.DONE
+    assert "Готово" in widget.item(0).text()
+    assert "таблиц: 2" in widget.item(0).text()
+
+
+def test_settings_dialog_applies_changes_without_mutating_original(qapp):
+    from bes_ocr.config.settings import Settings
+    from bes_ocr.gui.settings_dialog import SettingsDialog
+
+    original = Settings(ocr_languages="rus+eng", render_dpi=300, max_workers=4)
+    dialog = SettingsDialog(original)
+    dialog.lang_edit.setText("rus")
+    dialog.dpi_spin.setValue(400)
+    dialog.threads_spin.setValue(2)
+
+    updated = dialog.result_settings()
+    assert updated.ocr_languages == "rus"
+    assert updated.render_dpi == 400
+    assert updated.max_workers == 2
+    # Cancel/apply не должны задним числом менять объект, переданный в диалог.
+    assert original.ocr_languages == "rus+eng"
+    assert original.render_dpi == 300
+    assert original.max_workers == 4
+
+
+def test_double_click_done_file_opens_result(qapp, text_pdf, tmp_path, monkeypatch):
+    from bes_ocr.gui.main_window import MainWindow
+    from bes_ocr.gui.widgets import FileStatus
+
+    opened = []
+    monkeypatch.setattr("bes_ocr.gui.main_window._open_folder", lambda p: opened.append(p))
+
+    window = MainWindow()
+    window._add_files([text_pdf])
+    window.output_paths[text_pdf] = str(tmp_path / "result.docx")
+    (tmp_path / "result.docx").write_bytes(b"fake")
+    window.file_list.set_status(text_pdf, os.path.basename(text_pdf), FileStatus.DONE, "ok")
+
+    window._on_file_item_double_clicked(window.file_list.item(0))
+    assert opened == [str(tmp_path / "result.docx")]

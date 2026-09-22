@@ -5,25 +5,61 @@ row_span/col_span для объединённых ячеек:
 
 * `detect_tables_pdfplumber` — для страниц с пригодным текстовым слоем:
   границы ячеек и точный текст берутся напрямую из PDF.
-* `detect_tables_opencv` — для сканов: сетка строится по линиям
-  (морфология OpenCV), текст каждой ячейки распознаётся отдельным вызовом
-  OCR (точнее, чем резать текст всей страницы по координатам).
+* `detect_tables_img2table` — для сканов: обнаружение сетки и OCR ячеек
+  через библиотеку img2table (см. ниже, почему не собственная реализация
+  на OpenCV).
+
+## Почему img2table, а не собственный детектор на OpenCV
+
+Первая версия этого модуля строила сетку таблицы сама (морфология +
+преобразование Хафа для устойчивости к перекосу скана). На синтетических
+тестовых PDF это работало, но на реальном сканированном документе
+(скреплённый/сшитый бланк, типичная лёгкая "волнистость" строк от кривизны
+разворота при сканировании) давало катастрофически неверный результат:
+таблицы либо не находились вовсе, либо соседние строки ошибочно
+склеивались в одну ячейку, смешивая текст разных студентов/полей в одну
+кашу — то есть именно то, что проект должен был предотвратить в первую
+очередь (см. CLAUDE.md: таблицы — главный приоритет).
+
+img2table (MIT, github.com/xavctn/img2table) — зрелая, специально для этой
+задачи написанная библиотека: определение сетки по линиям и по
+выравниванию (в т.ч. безграничных таблиц), устойчивое сопоставление
+OCR-текста ячейкам, поддержка объединённых ячеек "из коробки", работает
+локально на CPU (не требует нейросетей/GPU — совместимо с офлайн-требованием
+проекта и Astra Linux), взаимодействует с тем же Tesseract. Проверка на
+реальном документе показала кардинально более точный результат (корректная
+сетка вместо развала таблицы) и заметно быстрее собственной реализации.
+Итог: не имеет смысла поддерживать свой менее надёжный детектор, когда
+специализированная библиотека решает эту же задачу лучше — заменяем
+полностью, а не оставляем как fallback.
 """
 from __future__ import annotations
+
+import logging
 
 import pdfplumber
 
 from ..config.settings import Settings
 from .models import BBox, Paragraph, Run, Table, TableCell, TableRow
-from .ocr_engine import OcrEngine
+
+logger = logging.getLogger("bes_ocr")
 
 
 def _round_bbox(bbox, ndigits: int = 1):
     return tuple(round(v, ndigits) for v in bbox)
 
 
-def detect_tables_pdfplumber(pdf_path: str, page_number: int) -> list[Table]:
-    """page_number — 0-based индекс страницы."""
+def detect_tables_pdfplumber(pdf_path: str, page_number: int, font_size_pt: float = 9.0) -> list[Table]:
+    """page_number — 0-based индекс страницы.
+
+    font_size_pt — размер шрифта тела документа (медиана по словам страницы,
+    см. page_processor), применяется к тексту ячеек таблицы. Без этого текст
+    ячеек получал зашитый по умолчанию в модели `Run.size_pt` (11pt), почти
+    всегда крупнее настоящего шрифта плотных таблиц бланков — из-за этого
+    ширина столбцов (взятая из реальной геометрии PDF/скана) не вмещала
+    текст на той же высоте строки, что и в оригинале, и таблица переносила
+    гораздо больше строк, раздувая документ на лишние страницы (измерено на
+    реальном документе: 2 страницы оригинала → 3 страницы результата)."""
     tables: list[Table] = []
     with pdfplumber.open(pdf_path) as pdf:
         page = pdf.pages[page_number]
@@ -94,331 +130,140 @@ def detect_tables_pdfplumber(pdf_path: str, page_number: int) -> list[Table]:
                     text = ""
                     if r < len(text_matrix) and c < len(text_matrix[r]):
                         text = (text_matrix[r][c] or "").strip()
-                    para = Paragraph(runs=[Run(text=text)]) if text else Paragraph(runs=[Run(text="")])
+                    para = Paragraph(runs=[Run(text=text, size_pt=font_size_pt)])
                     row_obj.cells.append(TableCell(blocks=[para], row_span=row_span, col_span=col_span))
                 table.rows.append(row_obj)
+            table.col_widths_pt = _column_widths_from_spans(grid_bbox, spans, n_cols)
             tables.append(table)
     return tables
 
 
-def _detect_grid_lines(binary_mask, axis: int, min_length_ratio: float):
-    """axis=0 → горизонтальные линии, axis=1 → вертикальные. Возвращает координаты (центры)."""
-    import cv2
-    import numpy as np
-
-    h, w = binary_mask.shape
-    if axis == 0:
-        size = max(10, w // 30)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (size, 1))
-    else:
-        size = max(10, h // 30)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, size))
-
-    eroded = cv2.erode(binary_mask, kernel, iterations=1)
-    lines_mask = cv2.dilate(eroded, kernel, iterations=1)
-
-    projection = lines_mask.sum(axis=1 if axis == 0 else 0) / 255
-    limit = (w if axis == 0 else h) * min_length_ratio
-    coords = []
-    in_line = False
-    start = 0
-    for i, val in enumerate(projection):
-        if val >= limit and not in_line:
-            in_line = True
-            start = i
-        elif val < limit and in_line:
-            in_line = False
-            coords.append((start + i - 1) // 2)
-    if in_line:
-        coords.append((start + len(projection) - 1) // 2)
-    return coords, lines_mask
+def _column_widths_from_spans(
+    grid_bbox: list[list[tuple | None]], spans: dict[tuple[int, int], tuple[int, int]], n_cols: int
+) -> list[float]:
+    """Ширина каждого столбца — по ячейкам без горизонтального объединения
+    (col_span == 1), иначе ширина объединённой на несколько столбцов ячейки
+    ошибочно приписалась бы каждому из них. Нужна, чтобы таблица в DOCX
+    сохраняла пропорции исходной, а не получала одинаковые по ширине
+    столбцы по умолчанию."""
+    widths = [0.0] * n_cols
+    for (r, c), (_, col_span) in spans.items():
+        if col_span != 1 or r >= len(grid_bbox) or c >= len(grid_bbox[r]):
+            continue
+        bbox = grid_bbox[r][c]
+        if bbox is None:
+            continue
+        x0, _, x1, _ = bbox
+        widths[c] = max(widths[c], x1 - x0)
+    return [w if w > 0 else 50.0 for w in widths]
 
 
-def _hough_grid_lines(binary_crop, horizontal: bool, min_length_ratio: float, cluster_dist: int = 30):
-    """Находит координаты линий сетки через преобразование Хафа.
+def detect_tables_img2table(
+    image_bgr, settings: Settings, px_to_pt: float, font_size_pt: float = 9.0
+) -> list[Table]:
+    """Обнаруживает таблицы на растре скана через img2table + Tesseract.
 
-    В отличие от чисто морфологического подхода (эрозия строго горизонтальным/
-    вертикальным ядром), устойчиво к небольшому перекосу скана: реальные
-    сканы редко идеально ровные, и даже перекос менее градуса разрывает
-    тонкие линии на множество фрагментов при построчной/постолбцовой
-    проекции, из-за чего таблица не обнаруживается вовсе. Хаф ищет отрезки
-    близкой к горизонтали/вертикали ориентации напрямую, без этого
-    ограничения. Возвращает (координаты, маска с отрисованными линиями —
-    используется дальше для проверки наличия границы при поиске
-    объединённых ячеек).
-    """
-    import math
-
-    import cv2
-    import numpy as np
-
-    h, w = binary_crop.shape
-    min_len = max(20, (w if horizontal else h) * min_length_ratio)
-    mask = np.zeros_like(binary_crop)
-
-    # threshold высокий относительно minLineLength: сплошная линованная
-    # линия таблицы набирает почти полный голос почти на всей своей длине,
-    # тогда как строка текста (даже длинная) — рыхлая/прерывистая из-за
-    # засечек и пробелов между буквами и почти никогда не проходит порог
-    # 0.7*min_len. Это отсекает текст, который иначе Хаф с меньшим порогом
-    # иногда принимает за линию таблицы.
-    lines = cv2.HoughLinesP(
-        binary_crop,
-        1,
-        np.pi / 720,
-        threshold=max(10, int(min_len * 0.7)),
-        minLineLength=int(min_len),
-        maxLineGap=max(10, int(min_len * 0.05)),
-    )
-    if lines is None:
-        return [], mask
-
-    raw: list[float] = []
-    angle_tol_deg = 5
-    for x1, y1, x2, y2 in lines.reshape(-1, 4):
-        angle = math.degrees(math.atan2(y2 - y1, x2 - x1))
-        if horizontal and abs(angle) < angle_tol_deg:
-            raw.append((y1 + y2) / 2.0)
-            cv2.line(mask, (int(x1), int(y1)), (int(x2), int(y2)), 255, 3)
-        elif (not horizontal) and abs(abs(angle) - 90) < angle_tol_deg:
-            raw.append((x1 + x2) / 2.0)
-            cv2.line(mask, (int(x1), int(y1)), (int(x2), int(y2)), 255, 3)
-
-    raw.sort()
-    clustered: list[tuple[float, int]] = []
-    for c in raw:
-        if clustered and abs(c - clustered[-1][0]) < cluster_dist:
-            prev_c, n = clustered[-1]
-            clustered[-1] = ((prev_c * n + c) / (n + 1), n + 1)
-        else:
-            clustered.append((c, 1))
-
-    coords = [int(round(c)) for c, _ in clustered]
-    return coords, mask
-
-
-def _find_table_regions(binary, min_area_ratio: float = 0.01):
-    """Находит прямоугольные области, где присутствуют и горизонтальные, и
-    вертикальные линии — кандидаты в таблицы. Порог длины линии считается
-    относительно самой области, а не всей страницы, чтобы находить и
-    небольшие таблицы, занимающие лишь часть страницы.
+    image_bgr — уже отрендеренная страница (см. page_processor), px_to_pt —
+    коэффициент перевода пиксельных координат рендера в точки PDF (для
+    единообразия с координатами слов текстового слоя/OCR на этой же
+    странице, см. page_processor._filter_words_outside_tables). font_size_pt —
+    см. detect_tables_pdfplumber — та же проблема раздувания страниц лишними
+    переносами актуальна и для сканов.
     """
     import cv2
 
-    h, w = binary.shape
-    h_coords_raw, h_mask_raw = _detect_grid_lines(binary, axis=0, min_length_ratio=0.03)
-    v_coords_raw, v_mask_raw = _detect_grid_lines(binary, axis=1, min_length_ratio=0.03)
-    if not h_coords_raw or not v_coords_raw:
+    try:
+        from img2table.document import Image as Img2TableImage
+        from img2table.ocr import TesseractOCR
+    except ImportError:
+        logger.warning("img2table не установлен — таблицы на сканах не будут обнаружены")
         return []
 
-    combined = cv2.bitwise_or(h_mask_raw, v_mask_raw)
-    combined = cv2.dilate(combined, cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)))
-    contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    ok, buf = cv2.imencode(".png", image_bgr)
+    if not ok:
+        return []
 
-    regions = []
-    min_area = w * h * min_area_ratio
-    for cnt in contours:
-        x, y, cw, ch = cv2.boundingRect(cnt)
-        if cw * ch < min_area or cw < 30 or ch < 30:
-            continue
-        regions.append((max(0, x - 5), max(0, y - 5), min(w, x + cw + 5), min(h, y + ch + 5)))
-    return regions
-
-
-def _map_rect_to_original(x0, y0, x1, y1, inv_matrix):
-    """Переводит прямоугольник из координат выровненного (повёрнутого)
-    изображения обратно в координаты исходного скана."""
-    if inv_matrix is None:
-        return x0, y0, x1, y1
-    import numpy as np
-
-    pts = np.array([[x0, y0, 1.0], [x1, y0, 1.0], [x1, y1, 1.0], [x0, y1, 1.0]])
-    mapped = pts @ inv_matrix.T
-    xs, ys = mapped[:, 0], mapped[:, 1]
-    return float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())
-
-
-def detect_tables_opencv(image_bgr, ocr_engine: OcrEngine, settings: Settings) -> list[Table]:
-    """Обнаруживает таблицы по линиям на растре скана.
-
-    Поиск линий сетки выполняется на выровненной (deskewed) копии страницы —
-    даже небольшой перекос скана (доли градуса) ломает построчную/постолбцовую
-    детекцию линий, хотя визуально почти незаметен. Но текст ячеек
-    распознаётся по ИСХОДНОМУ, неповёрнутому изображению: поворот
-    (warpAffine, даже с INTER_CUBIC) заметно размывает некрупный текст и
-    резко ухудшает точность OCR. Поэтому координаты найденной сетки
-    пересчитываются обратно в координаты исходного изображения перед
-    вырезкой ячеек и перед сохранением bbox таблицы.
-    """
-    import cv2
-
-    from .ocr_engine import estimate_skew_angle
-
-    angle = estimate_skew_angle(image_bgr)
-    h, w = image_bgr.shape[:2]
-    if abs(angle) < 0.1 or abs(angle) > 15:
-        rotated = image_bgr
-        inv_matrix = None
-    else:
-        center = (w / 2, h / 2)
-        matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
-        rotated = cv2.warpAffine(
-            image_bgr, matrix, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE
+    ocr = TesseractOCR(lang=settings.ocr_languages)
+    doc = Img2TableImage(src=buf.tobytes(), detect_rotation=True)
+    try:
+        extracted = doc.extract_tables(
+            ocr=ocr, implicit_rows=False, borderless_tables=False, min_confidence=50
         )
-        inv_matrix = cv2.invertAffineTransform(matrix)
+    except Exception as exc:  # noqa: BLE001 - библиотека может кидать разные типы на "мусорных" страницах
+        logger.warning("img2table: не удалось обработать страницу (%s)", exc)
+        return []
 
-    gray = cv2.cvtColor(rotated, cv2.COLOR_BGR2GRAY)
-    binary = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 25, 10
-    )
-
-    regions = _find_table_regions(binary)
     tables: list[Table] = []
-    for rx0, ry0, rx1, ry1 in regions:
-        crop = binary[ry0:ry1, rx0:rx1]
-        table = _detect_table_in_region(crop, image_bgr, inv_matrix, rx0, ry0, ocr_engine, settings)
+    for et in extracted:
+        table = _convert_img2table(et, px_to_pt, font_size_pt)
         if table is not None:
             tables.append(table)
     return tables
 
 
-def _detect_table_in_region(
-    binary_crop, original_image_bgr, inv_matrix, off_x: int, off_y: int, ocr_engine: OcrEngine, settings: Settings
-):
-    h_coords_l, h_mask = _hough_grid_lines(binary_crop, horizontal=True, min_length_ratio=settings.table_line_min_length_ratio)
-    v_coords_l, v_mask = _hough_grid_lines(binary_crop, horizontal=False, min_length_ratio=settings.table_line_min_length_ratio)
-
-    if len(h_coords_l) < 2 or len(v_coords_l) < 2:
+def _convert_img2table(extracted_table, px_to_pt: float, font_size_pt: float = 9.0) -> Table | None:
+    rows = list(extracted_table.content.values())
+    if not rows:
         return None
 
-    h_coords = [c + off_y for c in h_coords_l]
-    v_coords = [c + off_x for c in v_coords_l]
+    # img2table представляет объединённую ячейку повтором ОДНОГО И ТОГО ЖЕ
+    # bbox на всех позициях сетки (по строкам и/или столбцам), которые она
+    # покрывает — группируем по bbox, как и для pdfplumber выше.
+    key_grid: list[list[tuple]] = [
+        [(c.bbox.x1, c.bbox.y1, c.bbox.x2, c.bbox.y2) for c in row] for row in rows
+    ]
 
-    # Проверка объединения ячеек — по самому бинарному изображению кропа, а
-    # не по разреженной маске из отфильтрованных длинных линий Хафа: реальный
-    # скан бумажного (часто сшитого/скреплённого) документа обычно не просто
-    # повёрнут на постоянный угол, а слегка "волнистый" — одна и та же линия
-    # таблицы может отклоняться по вертикали на десятки пикселей между левым
-    # и правым краем страницы сильнее, чем предсказывает единый угол
-    # поворота всей страницы. Поэтому границу ищем не строго в ожидаемой
-    # координате, а лучшим совпадением в широком окне поиска вокруг неё —
-    # это специально смещает баланс в сторону "не объединять", если есть
-    # сомнение: ложное объединение необратимо склеивает текст разных строк в
-    # одну ячейку, а пропущенное объединение просто оставляет две ячейки с
-    # похожим содержимым, что гораздо легче заметить и не искажает данные.
-    # Радиус поиска — с учётом ТОЛЬКО двух конкретных соседних полос, между
-    # которыми проверяется граница (не минимума по всей таблице: одна
-    # маленькая строка где-то ещё в таблице не должна сужать поиск там, где
-    # соседние строки высокие и волнистость линии может быть заметнее).
-    def _search_radius(gap_a: int, gap_b: int) -> int:
-        return max(18, min(35, min(gap_a, gap_b) // 3))
+    groups: dict[tuple, list[tuple[int, int]]] = {}
+    for r, row_keys in enumerate(key_grid):
+        for c, key in enumerate(row_keys):
+            groups.setdefault(key, []).append((r, c))
 
-    def vertical_border_present(x_expected, y0, y1, gap_before, gap_after) -> bool:
-        search = _search_radius(gap_before, gap_after)
-        x_lo = max(0, x_expected - search)
-        x_hi = min(binary_crop.shape[1], x_expected + search + 1)
-        y_lo, y_hi = max(0, y0 + 3), max(y0 + 4, y1 - 3)
-        band = binary_crop[y_lo:y_hi, x_lo:x_hi]
-        if band.size == 0:
-            return False
-        col_cov = (band > 0).mean(axis=0)
-        return bool(col_cov.size) and col_cov.max() > 0.6
+    cell_owner: dict[tuple[int, int], tuple[int, int]] = {}
+    spans: dict[tuple[int, int], tuple[int, int]] = {}
+    for key, positions in groups.items():
+        positions.sort()
+        top_left = positions[0]
+        rows_covered = sorted({p[0] for p in positions})
+        cols_covered = sorted({p[1] for p in positions})
+        spans[top_left] = (len(rows_covered), len(cols_covered))
+        for p in positions:
+            cell_owner[p] = top_left
 
-    def horizontal_border_present(y_expected, x0, x1, gap_before, gap_after) -> bool:
-        search = _search_radius(gap_before, gap_after)
-        y_lo = max(0, y_expected - search)
-        y_hi = min(binary_crop.shape[0], y_expected + search + 1)
-        x_lo, x_hi = max(0, x0 + 3), max(x0 + 4, x1 - 3)
-        band = binary_crop[y_lo:y_hi, x_lo:x_hi]
-        if band.size == 0:
-            return False
-        row_cov = (band > 0).mean(axis=1)
-        return bool(row_cov.size) and row_cov.max() > 0.6
-
-    n_rows = len(h_coords_l) - 1
-    n_cols = len(v_coords_l) - 1
-    if n_rows < 1 or n_cols < 1:
-        return None
-
-    # Определяем отсутствующие внутренние границы → объединённые ячейки.
-    # border_present работает в локальных координатах кропа (h_coords_l/v_coords_l).
-    merged_right = [[False] * n_cols for _ in range(n_rows)]
-    merged_down = [[False] * n_cols for _ in range(n_rows)]
-    for r in range(n_rows):
-        for c in range(n_cols):
-            if c < n_cols - 1:
-                gap_before = v_coords_l[c + 1] - v_coords_l[c]
-                gap_after = v_coords_l[c + 2] - v_coords_l[c + 1] if c + 2 < len(v_coords_l) else gap_before
-                present = vertical_border_present(
-                    v_coords_l[c + 1], h_coords_l[r], h_coords_l[r + 1], gap_before, gap_after
-                )
-                merged_right[r][c] = not present
-            if r < n_rows - 1:
-                gap_before = h_coords_l[r + 1] - h_coords_l[r]
-                gap_after = h_coords_l[r + 2] - h_coords_l[r + 1] if r + 2 < len(h_coords_l) else gap_before
-                present = horizontal_border_present(
-                    h_coords_l[r + 1], v_coords_l[c], v_coords_l[c + 1], gap_before, gap_after
-                )
-                merged_down[r][c] = not present
-
-    owner = {}
-    span = {}
-    visited = [[False] * n_cols for _ in range(n_rows)]
-    for r in range(n_rows):
-        for c in range(n_cols):
-            if visited[r][c]:
-                continue
-            # растим прямоугольную область объединения вправо/вниз
-            c_end = c
-            while c_end + 1 < n_cols and merged_right[r][c_end]:
-                c_end += 1
-            r_end = r
-            can_grow = True
-            while can_grow and r_end + 1 < n_rows:
-                for cc in range(c, c_end + 1):
-                    if not merged_down[r_end][cc]:
-                        can_grow = False
-                        break
-                if can_grow:
-                    r_end += 1
-            for rr in range(r, r_end + 1):
-                for cc in range(c, c_end + 1):
-                    visited[rr][cc] = True
-                    owner[(rr, cc)] = (r, c)
-            span[(r, c)] = (r_end - r + 1, c_end - c + 1)
-
-    img_h, img_w = original_image_bgr.shape[:2]
-    table_ox0, table_oy0, table_ox1, table_oy1 = _map_rect_to_original(
-        v_coords[0], h_coords[0], v_coords[-1], h_coords[-1], inv_matrix
-    )
+    b = extracted_table.bbox
     table = Table(
-        bbox=BBox(table_ox0, table_oy0, table_ox1, table_oy1),
+        bbox=BBox(b.x1 * px_to_pt, b.y1 * px_to_pt, b.x2 * px_to_pt, b.y2 * px_to_pt),
         source="ocr",
     )
-    for r in range(n_rows):
+    for r, row in enumerate(rows):
         row_obj = TableRow()
-        for c in range(n_cols):
-            own = owner.get((r, c), (r, c))
-            if own != (r, c):
+        for c, cell in enumerate(row):
+            owner = cell_owner.get((r, c), (r, c))
+            if owner != (r, c):
                 row_obj.cells.append(TableCell(is_merge_continuation=True, row_span=0, col_span=0))
                 continue
-            row_span, col_span = span.get((r, c), (1, 1))
-            y0, y1 = h_coords[r], h_coords[r + row_span]
-            x0, x1 = v_coords[c], v_coords[c + col_span]
-            # Прямоугольник ячейки найден в координатах выровненной страницы;
-            # для OCR вырезаем из ИСХОДНОГО изображения (без размытия от
-            # поворота), поэтому пересчитываем координаты обратно.
-            ox0, oy0, ox1, oy1 = _map_rect_to_original(x0, y0, x1, y1, inv_matrix)
-            pad = 4
-            cx0 = max(0, min(img_w, int(ox0) + pad))
-            cx1 = max(cx0 + 1, min(img_w, int(ox1) - pad))
-            cy0 = max(0, min(img_h, int(oy0) + pad))
-            cy1 = max(cy0 + 1, min(img_h, int(oy1) - pad))
-            crop = original_image_bgr[cy0:cy1, cx0:cx1]
-            text = ocr_engine.recognize_cell_text(crop) if crop.size > 0 else ""
-            para = Paragraph(runs=[Run(text=text)])
+            row_span, col_span = spans.get((r, c), (1, 1))
+            text = (cell.value or "").strip()
+            para = Paragraph(runs=[Run(text=text, size_pt=font_size_pt)])
+            cb = cell.bbox
             row_obj.cells.append(
-                TableCell(blocks=[para], row_span=row_span, col_span=col_span, bbox=BBox(ox0, oy0, ox1, oy1))
+                TableCell(
+                    blocks=[para],
+                    row_span=row_span,
+                    col_span=col_span,
+                    bbox=BBox(cb.x1 * px_to_pt, cb.y1 * px_to_pt, cb.x2 * px_to_pt, cb.y2 * px_to_pt),
+                )
             )
         table.rows.append(row_obj)
+
+    # Ширина столбца — по ячейкам, которые НЕ являются горизонтальным
+    # объединением (col_span == 1): иначе ширина объединённой на несколько
+    # столбцов ячейки ошибочно приписалась бы каждому из них.
+    n_cols = max((len(r) for r in key_grid), default=0)
+    widths_px = [0.0] * n_cols
+    for (r, c), (row_span, col_span) in spans.items():
+        if col_span != 1:
+            continue
+        x0, _, x1, _ = key_grid[r][c]
+        widths_px[c] = max(widths_px[c], x1 - x0)
+    table.col_widths_pt = [(w if w > 0 else 50.0) * px_to_pt for w in widths_px]
     return table

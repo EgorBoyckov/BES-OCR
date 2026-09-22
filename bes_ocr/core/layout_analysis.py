@@ -10,7 +10,7 @@ import re
 import statistics
 from dataclasses import dataclass, field
 
-from .models import Alignment, Heading, ListItem, Paragraph, Run
+from .models import BBox, Alignment, Heading, ListItem, Paragraph, Run
 
 _ORDERED_RE = re.compile(r"^\s*(\d{1,3}|[a-zA-Zа-яА-Я])[.)]\s+")
 _BULLET_RE = re.compile(r"^\s*[•\-•‣◦⁃*]\s+")
@@ -58,22 +58,35 @@ class LayoutLine:
         return statistics.median([w.size_pt for w in self.words]) if self.words else 11.0
 
 
-def words_to_lines(words: list[LayoutWord], y_tolerance: float = 3.0) -> list[LayoutLine]:
-    """Группирует слова в строки по вертикальному перекрытию, слева направо."""
+def words_to_lines(words: list[LayoutWord], y_tolerance: float = 4.0) -> list[LayoutLine]:
+    """Группирует слова в строки по вертикальному перекрытию, слева направо.
+
+    Однопроходная группировка по СКОЛЬЗЯЩЕМУ СРЕДНЕМУ центру накопленной
+    строки (а не по её мгновенному min/max bbox, который дрейфует по мере
+    добавления слов и делает результат чувствительным к порядку обработки).
+    На реальных сканах слова одной и той же визуальной строки (особенно
+    из независимо распознанных смежных блоков текста) редко имеют абсолютно
+    одинаковый y0/y1 (дрожание OCR-рамок), и старая версия (сравнение с
+    каждой уже существующей строкой по её текущему bbox) иногда
+    непредсказуемо не сливала слова одной и той же строки.
+    """
     if not words:
         return []
-    sorted_words = sorted(words, key=lambda w: (round((w.y0 + w.y1) / 2), w.x0))
+    sorted_words = sorted(words, key=lambda w: ((w.y0 + w.y1) / 2, w.x0))
     lines: list[LayoutLine] = []
+    current: list[LayoutWord] = []
+    current_center = 0.0
     for w in sorted_words:
         center = (w.y0 + w.y1) / 2
-        placed = False
-        for line in lines:
-            if abs(((line.y0 + line.y1) / 2) - center) <= y_tolerance + (line.y1 - line.y0) * 0.3:
-                line.words.append(w)
-                placed = True
-                break
-        if not placed:
-            lines.append(LayoutLine(words=[w]))
+        if current:
+            avg_height = sum(ww.y1 - ww.y0 for ww in current) / len(current)
+            if abs(center - current_center) > y_tolerance + avg_height * 0.35:
+                lines.append(LayoutLine(words=current))
+                current = []
+        current.append(w)
+        current_center = sum((ww.y0 + ww.y1) / 2 for ww in current) / len(current)
+    if current:
+        lines.append(LayoutLine(words=current))
     for line in lines:
         line.words.sort(key=lambda w: w.x0)
     lines.sort(key=lambda ln: ln.y0)
@@ -122,6 +135,14 @@ def build_blocks(
     body_size = statistics.median([ln.median_size for ln in (multi_word_lines or lines)])
     blocks: list[object] = []
     prev_line: LayoutLine | None = None
+    # Стек отступов вложенных списков (п.4 ТЗ: сохранять уровни списка, а не
+    # только сам факт "это список"): маркированные/нумерованные строки идут
+    # в документе не помеченными уровнем — глубина вложенности определяется
+    # только относительным отступом (line.x0) соседних пунктов списка.
+    # Допуск в 8pt отсеивает дрожание OCR-координат внутри одного уровня, не
+    # давая ему ошибочно создать лишний уровень вложенности.
+    list_indent_stack: list[float] = []
+    _LIST_INDENT_TOLERANCE = 8.0
 
     for line in lines:
         gap = (line.y0 - prev_line.y1) if prev_line else 0.0
@@ -142,13 +163,37 @@ def build_blocks(
         ordered_match = _ORDERED_RE.match(text)
         bullet_match = _BULLET_RE.match(text)
 
+        line_bbox = BBox(line.x0, line.y0, line.x1, line.y1)
+
+        # Реальный зазор перед новым блоком (п.7.2 ТЗ scan2docx-inspired
+        # "text fit"): DOCX по умолчанию (шаблон python-docx/Word) добавляет
+        # своё собственное фиксированное "space after" (10pt) и межстрочный
+        # множитель 1.15× для КАЖДОГО абзаца — независимо от того, насколько
+        # плотно или свободно расположены строки в оригинале. На плотных
+        # бланках/таблицах это накапливается и раздувает документ на лишние
+        # страницы точно так же, как раздувал неверный размер шрифта ячеек
+        # таблицы (см. table_detection.py); здесь та же проблема, но для
+        # обычного текста — раньше `space_before_pt` в модели существовал,
+        # но нигде не заполнялся и не читался.
+        block_space_before = max(0.0, gap) if new_paragraph else 0.0
+
         if is_heading:
             level = 1 if line.median_size > body_size * 1.45 else 2
-            blocks.append(Heading(runs=runs, alignment=alignment, level=level, bbox=None))
+            blocks.append(
+                Heading(
+                    runs=runs, alignment=alignment, level=level, bbox=line_bbox,
+                    space_before_pt=block_space_before,
+                )
+            )
         elif ordered_match or bullet_match:
             marker = ordered_match.group(0).strip() if ordered_match else bullet_match.group(0).strip()
             clean_text = text[len(ordered_match.group(0)) :] if ordered_match else text[len(bullet_match.group(0)) :]
             item_runs = [Run(text=clean_text, size_pt=line.median_size)]
+            while list_indent_stack and line.x0 < list_indent_stack[-1] - _LIST_INDENT_TOLERANCE:
+                list_indent_stack.pop()
+            if not list_indent_stack or line.x0 > list_indent_stack[-1] + _LIST_INDENT_TOLERANCE:
+                list_indent_stack.append(line.x0)
+            level = len(list_indent_stack) - 1
             blocks.append(
                 ListItem(
                     runs=item_runs,
@@ -156,13 +201,28 @@ def build_blocks(
                     ordered=bool(ordered_match),
                     marker=marker,
                     indent_pt=line.x0,
+                    level=level,
+                    bbox=line_bbox,
+                    space_before_pt=block_space_before,
                 )
             )
         elif new_paragraph or not blocks or not isinstance(blocks[-1], Paragraph) or isinstance(blocks[-1], (Heading, ListItem)):
-            blocks.append(Paragraph(runs=runs, alignment=alignment, indent_pt=line.x0))
+            blocks.append(
+                Paragraph(
+                    runs=runs, alignment=alignment, indent_pt=line.x0, bbox=line_bbox,
+                    space_before_pt=block_space_before,
+                )
+            )
         else:
             last = blocks[-1]
             last.runs.append(Run(text=" " + line.text, size_pt=line.median_size))
+            if last.bbox is not None:
+                last.bbox = BBox(
+                    min(last.bbox.x0, line_bbox.x0),
+                    last.bbox.y0,
+                    max(last.bbox.x1, line_bbox.x1),
+                    line_bbox.y1,
+                )
 
         prev_line = line
 

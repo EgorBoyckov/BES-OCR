@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -80,6 +81,8 @@ def process_document(
     if not os.path.isfile(pdf_path):
         raise PdfOpenError(f"Файл не найден: {pdf_path}")
 
+    doc_start = time.monotonic()
+    file_name = os.path.basename(pdf_path)
     cancel_token = cancel_token or CancellationToken()
     ocr_engine = OcrEngine(settings)
 
@@ -88,9 +91,11 @@ def process_document(
             progress_cb(ProgressEvent(stage=stage, current_page=current, total_pages=total))
 
     emit("Открытие PDF", 0, 0)
+    logger.info("Открытие файла: %s", file_name)
     with PdfSource(pdf_path) as pdf:
         total_pages = pdf.page_count
-        document = Document(source_filename=os.path.basename(pdf_path))
+        document = Document(source_filename=file_name)
+        logger.info("%s: %d стр., потоков обработки: %d", file_name, total_pages, settings.max_workers)
 
         pages: list[Optional[Page]] = [None] * total_pages
         emit("Обработка страниц", 0, total_pages)
@@ -141,5 +146,16 @@ def process_document(
             if page.blocks and getattr(page.blocks[-1], "text", "").strip() == footer_text:
                 page.blocks.pop()
 
+    n_tables = sum(1 for page in document.pages for b in page.blocks if hasattr(b, "n_rows"))
+    n_images = sum(1 for page in document.pages for b in page.blocks if type(b).__name__ == "ImageBlock")
+    logger.info(
+        "%s готов: %d стр., таблиц: %d, изображений: %d, предупреждений: %d, %.1f с",
+        file_name,
+        len(document.pages),
+        n_tables,
+        n_images,
+        len(document.warnings),
+        time.monotonic() - doc_start,
+    )
     emit("Готово", total_pages, total_pages)
     return document

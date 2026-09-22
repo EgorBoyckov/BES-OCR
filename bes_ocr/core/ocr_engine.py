@@ -6,6 +6,7 @@ bbox и confidence — нужно и для layout-анализа, и для р�
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 import cv2
@@ -93,21 +94,43 @@ def binarize(image_bgr: np.ndarray) -> np.ndarray:
     return thresh
 
 
-def preprocess_for_ocr(image_bgr: np.ndarray) -> np.ndarray:
-    return binarize(deskew(image_bgr))
+def preprocess_for_ocr(image_bgr: np.ndarray, do_deskew: bool = True) -> np.ndarray:
+    return binarize(deskew(image_bgr) if do_deskew else image_bgr)
+
+
+def stroke_width_px(binary: np.ndarray, x0: float, y0: float, x1: float, y1: float) -> float | None:
+    """Типичная толщина штриха символов внутри рамки (в пикселях) — по
+    гребню карты расстояний до фона. Используется для распознавания
+    полужирного начертания: у OCR нет информации о шрифте, но полужирный
+    текст на скане заметно "толще" обычного того же кегля."""
+    h, w = binary.shape[:2]
+    xa, ya, xb, yb = max(0, int(x0)), max(0, int(y0)), min(w, int(x1)), min(h, int(y1))
+    if xb - xa < 3 or yb - ya < 3:
+        return None
+    ink = (binary[ya:yb, xa:xb] == 0).astype(np.uint8)
+    if int(ink.sum()) < 15:
+        return None
+    dist = cv2.distanceTransform(ink, cv2.DIST_L2, 3)
+    ridge = (dist > 0) & (dist >= cv2.dilate(dist, np.ones((3, 3), np.uint8)))
+    values = dist[ridge]
+    if values.size == 0:
+        return None
+    return float(2.0 * np.median(values))
 
 
 class OcrEngine:
     def __init__(self, settings: Settings):
         self.settings = settings
 
-    def recognize_words(self, image_bgr: np.ndarray, preprocess: bool = True) -> list[OcrWord]:
-        image = preprocess_for_ocr(image_bgr) if preprocess else image_bgr
+    def recognize_words(
+        self, image_bgr: np.ndarray, preprocess: bool = True, do_deskew: bool = True, psm: int = 3
+    ) -> list[OcrWord]:
+        image = preprocess_for_ocr(image_bgr, do_deskew=do_deskew) if preprocess else image_bgr
         data = pytesseract.image_to_data(
             image,
             lang=self.settings.ocr_languages,
             output_type=pytesseract.Output.DICT,
-            config="--psm 3",
+            config=f"--psm {psm}",
         )
         words: list[OcrWord] = []
         n = len(data["text"])
@@ -142,6 +165,41 @@ class OcrEngine:
             )
         return words
 
+    def recognize_region(
+        self, binary: np.ndarray, x0: int, y0: int, x1: int, y1: int, inset: int = 4
+    ) -> list[OcrWord]:
+        """Распознаёт прямоугольную область (обычно ячейку таблицы) уже
+        бинаризованного растра отдельно от остальной страницы.
+
+        Сегментация страницы целиком (psm 3) в плотных таблицах регулярно
+        теряет содержимое узких ячеек ("№", номера строк) и склеивает слова
+        соседних ячеек через линию границы; распознавание каждой ячейки как
+        самостоятельного блока (psm 6) этих проблем не имеет. Координаты
+        слов возвращаются в системе координат всей страницы.
+        """
+        h, w = binary.shape[:2]
+        xa, ya = max(0, x0 + inset), max(0, y0 + inset)
+        xb, yb = min(w, x1 - inset), min(h, y1 - inset)
+        if xb - xa < 4 or yb - ya < 4:
+            return []
+        crop = binary[ya:yb, xa:xb]
+        if int(np.count_nonzero(crop == 0)) < 12:
+            return []  # пустая ячейка
+        pad = 12
+        padded = cv2.copyMakeBorder(crop, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=255)
+        words = self.recognize_words(padded, preprocess=False, psm=6)
+        if not words:
+            words = self.recognize_words(padded, preprocess=False, psm=7)
+        if not words:
+            # Одиночный символ (номер строки в узкой графе "№").
+            words = self.recognize_words(padded, preprocess=False, psm=10)
+        for word in words:
+            word.x0 += xa - pad
+            word.x1 += xa - pad
+            word.y0 += ya - pad
+            word.y1 += ya - pad
+        return words
+
     def is_likely_handwriting_or_noise(self, words: list[OcrWord]) -> bool:
         """Эвристика п.3 ТЗ: рукописный/нераспознаваемый текст → не плодить мусор."""
         if not words:
@@ -149,6 +207,30 @@ class OcrEngine:
         low_conf = [w for w in words if w.confidence < self.settings.handwriting_confidence_threshold]
         ratio = len(low_conf) / len(words)
         return ratio >= self.settings.handwriting_garbage_word_ratio
+
+
+_PLAUSIBLE_WORD_RE = re.compile(
+    r"^[«\"'(\[]?("
+    r"[А-ЯЁа-яё]{3,}(-[А-ЯЁа-яё]+)*"
+    r"|[A-Za-z]{3,}(-[A-Za-z]+)*"
+    r"|\d+([.,:/-]\d+)*"
+    r")[»\"')\].,:;!?]{0,2}$"
+)
+
+
+def is_plausible_word(text: str) -> bool:
+    """Похоже ли распознанное слово на обычное слово/число, а не на
+    обрывок штриха. Уверенность Tesseract для целого слова откалибрована
+    плохо: на реальных сканах правильно прочитанные слова нередко получают
+    20–30%, и отбрасывать их только по порогу — значит терять текст."""
+    text = text.strip()
+    if not _PLAUSIBLE_WORD_RE.match(text):
+        return False
+    letters = [ch for ch in text if ch.isalpha()]
+    # Слово из смеси заглавных и строчных посередине ("ПрОфИль") — типичный мусор.
+    if len(letters) >= 3 and any(ch.isupper() for ch in letters[1:]) and any(ch.islower() for ch in letters[1:]):
+        return False
+    return True
 
 
 def _cluster_words_by_proximity(words: list[OcrWord], gap: float) -> list[list[OcrWord]]:
@@ -222,5 +304,11 @@ def find_noise_regions(
         y1 = max(w.y1 for w in cluster)
         if (x1 - x0) * (y1 - y0) > 0.05 * page_area:
             continue  # похоже на обычный плотный абзац текста, а не на пятно шума
-        regions.append((x0, y0, x1, y1))
+        # Сам участок — без "нормальных" слов скопления (обычно строка
+        # текста рядом с подписью): они не должны оказаться внутри
+        # изображения и пропасть из текста.
+        core = [w for w in cluster if not is_plausible_word(w.text)] or suspect
+        regions.append(
+            (min(w.x0 for w in core), min(w.y0 for w in core), max(w.x1 for w in core), max(w.y1 for w in core))
+        )
     return regions

@@ -36,10 +36,14 @@ OCR-текста ячейкам, поддержка объединённых я�
 from __future__ import annotations
 
 import logging
+import re
+import statistics
+from typing import Optional
 
 import pdfplumber
 
 from ..config.settings import Settings
+from .layout_analysis import LayoutWord, build_cell_blocks, words_to_lines
 from .models import BBox, Paragraph, Run, Table, TableCell, TableRow
 
 logger = logging.getLogger("bes_ocr")
@@ -131,11 +135,29 @@ def detect_tables_pdfplumber(pdf_path: str, page_number: int, font_size_pt: floa
                     if r < len(text_matrix) and c < len(text_matrix[r]):
                         text = (text_matrix[r][c] or "").strip()
                     para = Paragraph(runs=[Run(text=text, size_pt=font_size_pt)])
-                    row_obj.cells.append(TableCell(blocks=[para], row_span=row_span, col_span=col_span))
+                    cell_bbox = _merged_cell_bbox(grid_bbox, r, c, row_span, col_span)
+                    row_obj.cells.append(
+                        TableCell(blocks=[para], row_span=row_span, col_span=col_span, bbox=cell_bbox)
+                    )
+                row_bbox = getattr(pt.rows[r], "bbox", None)
+                if row_bbox:
+                    row_obj.height_pt = row_bbox[3] - row_bbox[1]
                 table.rows.append(row_obj)
             table.col_widths_pt = _column_widths_from_spans(grid_bbox, spans, n_cols)
             tables.append(table)
     return tables
+
+
+def _merged_cell_bbox(grid_bbox, r: int, c: int, row_span: int, col_span: int) -> BBox | None:
+    boxes = [
+        grid_bbox[rr][cc]
+        for rr in range(r, min(r + row_span, len(grid_bbox)))
+        for cc in range(c, min(c + col_span, len(grid_bbox[rr])))
+        if grid_bbox[rr][cc] is not None
+    ]
+    if not boxes:
+        return None
+    return BBox(min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes))
 
 
 def _column_widths_from_spans(
@@ -159,7 +181,7 @@ def _column_widths_from_spans(
 
 
 def detect_tables_img2table(
-    image_bgr, settings: Settings, px_to_pt: float, font_size_pt: float = 9.0
+    image_bgr, settings: Settings, px_to_pt: float, font_size_pt: float = 9.0, with_ocr: bool = True
 ) -> list[Table]:
     """Обнаруживает таблицы на растре скана через img2table + Tesseract.
 
@@ -183,8 +205,14 @@ def detect_tables_img2table(
     if not ok:
         return []
 
-    ocr = TesseractOCR(lang=settings.ocr_languages)
-    doc = Img2TableImage(src=buf.tobytes(), detect_rotation=True)
+    # Растр уже выровнен (deskew в page_processor), поэтому поворот
+    # img2table не нужен — иначе координаты ячеек оказались бы в системе
+    # координат ДРУГОГО (повёрнутого) растра, чем координаты слов OCR.
+    # Текст ячеек по умолчанию берётся из слов, уже распознанных на всей
+    # странице (fill_table_from_words) — повторный OCR внутри img2table
+    # только удваивал время и местами давал в ячейках строку "None".
+    ocr = TesseractOCR(lang=settings.ocr_languages) if with_ocr else None
+    doc = Img2TableImage(src=buf.tobytes(), detect_rotation=False)
     try:
         extracted = doc.extract_tables(
             ocr=ocr, implicit_rows=False, borderless_tables=False, min_confidence=50
@@ -243,6 +271,8 @@ def _convert_img2table(extracted_table, px_to_pt: float, font_size_pt: float = 9
                 continue
             row_span, col_span = spans.get((r, c), (1, 1))
             text = (cell.value or "").strip()
+            if text == "None":
+                text = ""
             para = Paragraph(runs=[Run(text=text, size_pt=font_size_pt)])
             cb = cell.bbox
             row_obj.cells.append(
@@ -253,6 +283,9 @@ def _convert_img2table(extracted_table, px_to_pt: float, font_size_pt: float = 9
                     bbox=BBox(cb.x1 * px_to_pt, cb.y1 * px_to_pt, cb.x2 * px_to_pt, cb.y2 * px_to_pt),
                 )
             )
+        single = [cell.bbox for c_i, cell in enumerate(row) if spans.get(cell_owner.get((r, c_i)), (1, 1))[0] == 1]
+        if single:
+            row_obj.height_pt = statistics.median(b.y2 - b.y1 for b in single) * px_to_pt
         table.rows.append(row_obj)
 
     # Ширина столбца — по ячейкам, которые НЕ являются горизонтальным
@@ -267,3 +300,99 @@ def _convert_img2table(extracted_table, px_to_pt: float, font_size_pt: float = 9
         widths_px[c] = max(widths_px[c], x1 - x0)
     table.col_widths_pt = [(w if w > 0 else 50.0) * px_to_pt for w in widths_px]
     return table
+
+
+# Символы, которые OCR часто "видит" на линиях границ ячеек и которые
+# прилипают к соседнему слову ("2|", "|Группа", "__").
+_BORDER_JUNK_RE = re.compile(r"^[|_\[\]]+|[|_\[\]]+$")
+_LEADING_QUOTE_JUNK_RE = re.compile(r"^[,‚„“”'\"`]+(?=\w)")
+_STANDALONE_SYMBOLS = {"№", "-", "–", "—", "%", "+", "=", "×", "*"}
+_WORD_DEFAULT_CELL_PADDING_PT = 5.4
+
+
+def _clean_cell_word(word: LayoutWord, bbox: BBox) -> Optional[LayoutWord]:
+    """Убирает "мусор" OCR на линиях границ ячеек: обрывки линий, принятые
+    за "—"/"_"/"|", и прилипшие к слову кавычки/запятые от засечек."""
+    text = _BORDER_JUNK_RE.sub("", word.text)
+    if not any(ch in "«»\"“”„" for ch in text[1:]):
+        text = _LEADING_QUOTE_JUNK_RE.sub("", text)
+    text = text.strip()
+    if not text:
+        return None
+    if not any(ch.isalnum() for ch in text):
+        if text not in _STANDALONE_SYMBOLS:
+            return None
+        # Черта вплотную к горизонтальной границе ячейки — обрывок линии.
+        cy = (word.y0 + word.y1) / 2
+        if text in {"-", "–", "—"} and (cy - bbox.y0 < 3.0 or bbox.y1 - cy < 3.0):
+            return None
+    if text == word.text:
+        return word
+    return LayoutWord(**{**word.__dict__, "text": text})
+
+
+def measure_cell_padding(cells_words: list[tuple[BBox, list[LayoutWord]]]) -> float:
+    """Внутреннее поле ячеек: не больше наименьшего зазора между самой
+    широкой строкой ячейки и её границами (иначе строка, поместившаяся в
+    ячейку оригинала, в Word перенесётся). Нижний дециль — чтобы одна
+    ячейка с ошибкой OCR у самой линии не обнуляла поле всей таблицы."""
+    gaps = []
+    for b, ws in cells_words:
+        if not ws:
+            continue
+        lines = words_to_lines(ws)
+        widest = max(lines, key=lambda ln: ln.x1 - ln.x0)
+        gaps.append(min(widest.x0 - b.x0, b.x1 - widest.x1))
+    gaps = [g for g in gaps if g >= 0.0]
+    if not gaps:
+        return _WORD_DEFAULT_CELL_PADDING_PT
+    gaps.sort()
+    return max(0.5, min(_WORD_DEFAULT_CELL_PADDING_PT, gaps[len(gaps) // 10] - 1.5))
+
+
+def fill_table_from_words(table: Table, words: list[LayoutWord], fit_spacing: bool = False) -> None:
+    """Заполняет ячейки таблицы абзацами из слов страницы (слово
+    принадлежит ячейке, в которую попадает его центр).
+
+    В отличие от "плоского" текста ячейки, так сохраняются кегль и
+    начертание каждого слова, выравнивание текста внутри ячейки (по центру
+    или по левому краю), принудительные переносы строк и вертикальное
+    выравнивание. Ячейка, в которую не попало ни одного слова, сохраняет
+    текст, полученный детектором таблиц (если он есть).
+    """
+    cells = [cell for row in table.rows for cell in row.cells if not cell.is_merge_continuation and cell.bbox]
+    if not cells:
+        return
+    assigned: dict[int, list[LayoutWord]] = {id(c): [] for c in cells}
+    for w in words:
+        cx, cy = (w.x0 + w.x1) / 2, (w.y0 + w.y1) / 2
+        for cell in cells:
+            b = cell.bbox
+            if b.x0 <= cx <= b.x1 and b.y0 <= cy <= b.y1:
+                cleaned = _clean_cell_word(w, b) if table.source != "text" else w
+                if cleaned is not None:
+                    assigned[id(cell)].append(cleaned)
+                break
+    padding = measure_cell_padding([(c.bbox, assigned[id(c)]) for c in cells])
+    if table.cell_padding_pt is None:
+        table.cell_padding_pt = padding
+    for cell in cells:
+        cell_words = assigned[id(cell)]
+        if not cell_words:
+            continue
+        blocks = build_cell_blocks(cell_words, cell.bbox, padding=table.cell_padding_pt, fit_spacing=fit_spacing)
+        if not blocks:
+            continue
+        cell.blocks = blocks
+        cell.v_align = _vertical_alignment(cell.bbox, cell_words)
+
+
+def _vertical_alignment(bbox: BBox, words: list[LayoutWord]) -> str:
+    top_gap = min(w.y0 for w in words) - bbox.y0
+    bottom_gap = bbox.y1 - max(w.y1 for w in words)
+    height = max(bbox.y1 - bbox.y0, 1.0)
+    if top_gap > 0.2 * height and bottom_gap > 0.2 * height and abs(top_gap - bottom_gap) <= 0.35 * max(top_gap, bottom_gap) + 2:
+        return "center"
+    if top_gap > 0.3 * height and bottom_gap < 0.5 * top_gap:
+        return "bottom"
+    return "top"

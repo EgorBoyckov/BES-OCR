@@ -284,3 +284,89 @@ def corrupted_pdf(fixtures_dir) -> str:
 @pytest.fixture()
 def no_text_layer_pdf(russian_scanned_pdf) -> str:
     return russian_scanned_pdf
+
+
+SERIF_FONT_PATHS = (
+    "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+)
+SERIF_BOLD_FONT_PATHS = (
+    "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
+)
+
+
+def _first_font(paths, size):
+    for p in paths:
+        if os.path.isfile(p):
+            return ImageFont.truetype(p, size)
+    return None
+
+
+@pytest.fixture()
+def official_form_scan_pdf(fixtures_dir) -> str:
+    """Скан (300 dpi) типового бланка, воспроизводящий сценарии реального
+    документа из отчёта пользователя: шапка из двух строк по правому краю,
+    полужирный заголовок по центру, нумерованный список, реквизиты сторон
+    в две колонки и синяя печать, частично перекрывающая текст. Шрифт —
+    Liberation Serif (метрически совместим с Times New Roman) 12pt."""
+    regular = _first_font(SERIF_FONT_PATHS, 50)  # 12pt при 300 dpi
+    bold = _first_font(SERIF_BOLD_FONT_PATHS, 50)
+    if regular is None or bold is None or "Liberation" not in (regular.path or ""):
+        pytest.skip("нужен шрифт Liberation Serif (метрически совместимый с Times New Roman)")
+    path = os.path.join(fixtures_dir, "official_form_scan.pdf")
+    img = Image.new("RGB", (2480, 3508), "white")
+    draw = ImageDraw.Draw(img)
+    pitch = 58  # ~14pt
+    left, right = 250, 2330
+
+    draw.text((right, 180), "Приложение 1", font=regular, fill="black", anchor="rs")
+    draw.text((right, 180 + pitch), "к договору № 618д/2025 о практической подготовке обучающихся",
+              font=regular, fill="black", anchor="rs")
+    center = (left + right) // 2
+    draw.text((center, 360), "Образовательная программа и перечень отчетных документов",
+              font=bold, fill="black", anchor="ms")
+    draw.text((center, 360 + pitch), "по практической подготовке обучающихся", font=bold, fill="black", anchor="ms")
+
+    y = 560
+    for text in ("Перечень отчетных документов",):
+        draw.text((left, y), text, font=bold, fill="black", anchor="ls")
+    for i, text in enumerate((
+        "1. Совместный рабочий график проведения практики",
+        "2. Индивидуальное задание обучающегося",
+        "3. Отчет по практике с приложениями",
+    )):
+        draw.text((left, y + (i + 1) * pitch), text, font=regular, fill="black", anchor="ls")
+
+    y = 900
+    gutter = 1350
+    left_col = (
+        "Университет:",
+        "Уральский государственный",
+        "экономический университет",
+        "Адрес: 620144, г. Екатеринбург",
+        "ул. 8 Марта, 62/45",
+    )
+    right_col = (
+        "Профильная организация:",
+        "Общество с ограниченной ответственностью",
+        "ИНН: 7203402981",
+        "Адрес: 625000, г. Тюмень",
+        "ул. Республики, д. 61",
+    )
+    for i, (lt, rt) in enumerate(zip(left_col, right_col)):
+        draw.text((left, y + i * pitch), lt, font=regular, fill="black", anchor="ls")
+        draw.text((gutter, y + i * pitch), rt, font=regular, fill="black", anchor="ls")
+
+    # Синяя печать: кольцо с текстом по кругу, частично поверх нижней строки
+    # правой колонки.
+    cx, cy, r = 1900, 1330, 190
+    stamp_blue = (40, 70, 200)
+    draw.ellipse((cx - r, cy - r, cx + r, cy + r), outline=stamp_blue, width=10)
+    draw.ellipse((cx - r + 40, cy - r + 40, cx + r - 40, cy + r - 40), outline=stamp_blue, width=6)
+    small = _first_font(SERIF_BOLD_FONT_PATHS, 34)
+    draw.text((cx, cy), "ПЕЧАТЬ", font=small, fill=stamp_blue, anchor="mm")
+    draw.line((1450, 1250, 1600, 1150, 1700, 1260), fill=stamp_blue, width=5)  # "подпись"
+
+    _image_pdf_from_pil(img, path)
+    return path

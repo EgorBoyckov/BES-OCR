@@ -45,15 +45,42 @@ class Run:
     italic: bool = False
     size_pt: float = 11.0
     font_name: Optional[str] = None
+    # Межбуквенный интервал (pt, отрицательный — уплотнённый): подгоняет
+    # ширину текста под ширину строк оригинала, чтобы текстовый процессор
+    # переносил строки там же, где они перенесены в оригинале.
+    char_spacing_pt: float = 0.0
 
 
 @dataclass
 class Paragraph:
+    """Абзац. Перевод строки внутри `Run.text` ("\n") — принудительный
+    разрыв строки оригинала (строка закончилась раньше, чем её вынудила бы
+    перенести ширина текста — типично для шапок/заголовков по центру или
+    справа); обычные (естественные) переносы не сохраняются — их заново
+    делает текстовый процессор.
+
+    Геометрия абзаца хранится в АБСОЛЮТНЫХ координатах исходной страницы
+    (точки PDF): `indent_pt` — левая граница строк (кроме первой),
+    `first_line_indent_pt` — сдвиг первой строки относительно неё
+    (отрицательный — выступ, как у пунктов списка), `right_edge_pt` —
+    правая граница, до которой текст переносится (None — до правого поля).
+    Пересчёт в отступы конкретного контейнера (страница или ячейка
+    таблицы) — задача генератора документа.
+    """
+
     runs: list[Run] = field(default_factory=list)
     alignment: Alignment = Alignment.LEFT
     indent_pt: float = 0.0
     space_before_pt: float = 0.0
     bbox: Optional[BBox] = None
+    first_line_indent_pt: float = 0.0
+    right_edge_pt: Optional[float] = None
+    # Базовая линия первой строки (абсолютная y) и измеренный шаг между
+    # базовыми линиями соседних строк абзаца — позволяют воспроизвести
+    # вертикальное положение текста точно, а не приблизительно.
+    baseline_pt: Optional[float] = None
+    line_pitch_pt: Optional[float] = None
+    n_lines: int = 1
 
     @property
     def text(self) -> str:
@@ -79,6 +106,7 @@ class TableCell:
     col_span: int = 1
     is_merge_continuation: bool = False  # ячейка, поглощённая другой (merge)
     bbox: Optional[BBox] = None
+    v_align: str = "top"  # "top" | "center" | "bottom"
 
     @property
     def text(self) -> str:
@@ -90,6 +118,7 @@ class TableCell:
 @dataclass
 class TableRow:
     cells: list[TableCell] = field(default_factory=list)
+    height_pt: Optional[float] = None  # высота строки в оригинале
 
 
 @dataclass
@@ -97,7 +126,14 @@ class Table:
     rows: list[TableRow] = field(default_factory=list)
     col_widths_pt: list[float] = field(default_factory=list)
     bbox: Optional[BBox] = None
-    source: str = "text"  # "text" (pdfplumber) | "ocr" (opencv grid)
+    source: str = "text"  # "text" (pdfplumber) | "ocr" (img2table) | "layout"
+    # Таблица-раскладка без рамок: так передаются многоколоночные блоки
+    # текста (например, реквизиты сторон договора в две колонки), которые
+    # в оригинале не являются таблицей, но должны остаться рядом друг с
+    # другом, а не слиться построчно в одну колонку.
+    borderless: bool = False
+    # Внутренний отступ текста от границ ячеек (измерен по оригиналу).
+    cell_padding_pt: Optional[float] = None
 
     @property
     def n_rows(self) -> int:
@@ -116,6 +152,10 @@ class ImageBlock:
     caption: Optional[str] = None
     bbox: Optional[BBox] = None
     fmt: str = "png"
+    # Плавающее изображение: ставится точно в координаты bbox на странице
+    # (за текстом) и не участвует в потоке текста — печати, подписи,
+    # отметки поверх напечатанного текста.
+    floating: bool = False
 
 
 @dataclass

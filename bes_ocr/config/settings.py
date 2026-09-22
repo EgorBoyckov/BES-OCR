@@ -16,6 +16,12 @@ class Settings:
     handwriting_confidence_threshold: float = 25.0
     handwriting_garbage_word_ratio: float = 0.6
     table_line_min_length_ratio: float = 0.25
+    # Цветные печати/подписи на сканах — отдельными изображениями поверх
+    # текста, а не мусором в OCR (см. core/color_marks.py).
+    extract_color_marks: bool = True
+    # Шрифт текста, распознанного OCR (у скана нет информации о шрифте;
+    # Times New Roman — стандарт официальных документов).
+    default_font_name: str = "Times New Roman"
     temp_dir_prefix: str = "bes_ocr_"
     log_dir: str = field(
         default_factory=lambda: os.path.join(

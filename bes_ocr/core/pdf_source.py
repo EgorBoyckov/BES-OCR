@@ -19,6 +19,7 @@ class WordBox:
     font_name: str = ""
     bold: bool = False
     italic: bool = False
+    baseline: float | None = None
 
 
 class PdfSource:
@@ -44,33 +45,57 @@ class PdfSource:
         return page.rect.width, page.rect.height
 
     def extract_text_words(self, page_number: int) -> list[WordBox]:
-        """Извлекает слова текстового слоя с координатами и форматированием."""
+        """Извлекает слова текстового слоя с координатами и форматированием.
+
+        Работаем на уровне символов (rawdict), а не спанов: спан PyMuPDF —
+        это обычно целая строка с одинаковым шрифтом, а анализу разметки
+        нужны настоящие слова с собственными рамками (маркер списка
+        отдельно от текста пункта, промежутки между колонками и т.п.).
+        """
         page = self._doc[page_number]
         result: list[WordBox] = []
-        raw = page.get_text("dict")
+        raw = page.get_text("rawdict")
         for block in raw.get("blocks", []):
             if block.get("type") != 0:
                 continue
             for line in block.get("lines", []):
                 for span in line.get("spans", []):
-                    text = span.get("text", "")
-                    if not text.strip():
-                        continue
+                    font = span.get("font", "")
                     flags = span.get("flags", 0)
-                    bbox = span.get("bbox", (0, 0, 0, 0))
-                    result.append(
-                        WordBox(
-                            text=text,
-                            x0=bbox[0],
-                            y0=bbox[1],
-                            x1=bbox[2],
-                            y1=bbox[3],
-                            font_size=span.get("size", 11.0),
-                            font_name=span.get("font", ""),
-                            bold=bool(flags & 2 ** 4) or "Bold" in span.get("font", ""),
-                            italic=bool(flags & 2 ** 1) or "Italic" in span.get("font", ""),
+                    size = span.get("size", 11.0)
+                    bold = bool(flags & 2 ** 4) or "Bold" in font
+                    italic = bool(flags & 2 ** 1) or "Italic" in font
+                    origin = span.get("origin")
+                    baseline = origin[1] if origin else None
+                    _, sy0, _, sy1 = span.get("bbox", (0, 0, 0, 0))
+                    current: list[dict] = []
+
+                    def flush() -> None:
+                        if not current:
+                            return
+                        text = "".join(ch["c"] for ch in current)
+                        result.append(
+                            WordBox(
+                                text=text,
+                                x0=min(ch["bbox"][0] for ch in current),
+                                y0=sy0,
+                                x1=max(ch["bbox"][2] for ch in current),
+                                y1=sy1,
+                                font_size=size,
+                                font_name=font,
+                                bold=bold,
+                                italic=italic,
+                                baseline=baseline,
+                            )
                         )
-                    )
+                        current.clear()
+
+                    for ch in span.get("chars", []):
+                        if ch.get("c", " ").isspace():
+                            flush()
+                        else:
+                            current.append(ch)
+                    flush()
         return result
 
     def raw_text(self, page_number: int) -> str:

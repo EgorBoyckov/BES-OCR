@@ -27,6 +27,7 @@ from .. import __app_name__, __version__
 from ..config.settings import DEFAULT_SETTINGS
 from ..jobs.worker import ConversionWorker
 from ..logging_setup import build_logger
+from .settings_dialog import SettingsDialog
 from .widgets import DropArea, FileListWidget, FileStatus
 
 _ACCENT = "#2f7fe0"
@@ -74,6 +75,7 @@ class MainWindow(QMainWindow):
         self.start_time: float = 0.0
         self.last_output_dir: str | None = None
         self.total_files_in_run: int = 0
+        self.output_paths: dict[str, str] = {}
 
         self._build_ui()
 
@@ -105,6 +107,11 @@ class MainWindow(QMainWindow):
         title_box.addWidget(subtitle)
         header_row.addLayout(title_box)
         header_row.addStretch(1)
+        self.btn_settings = QPushButton("Настройки…")
+        self.btn_settings.setFlat(True)
+        self.btn_settings.setStyleSheet(f"color:{_ACCENT}; font-size: 12px; border: none;")
+        self.btn_settings.clicked.connect(self._open_settings_dialog)
+        header_row.addWidget(self.btn_settings, alignment=Qt.AlignmentFlag.AlignTop)
         version_label = QLabel(f"версия {__version__}")
         version_label.setStyleSheet("color:#9aa5b1; font-size:11px;")
         header_row.addWidget(version_label, alignment=Qt.AlignmentFlag.AlignTop)
@@ -136,6 +143,8 @@ class MainWindow(QMainWindow):
         self.file_list.setStyleSheet(
             "QListWidget { background:white; border:1px solid #e3e7ed; border-radius:8px; }"
         )
+        self.file_list.setToolTip("Двойной клик по готовому файлу открывает результат")
+        self.file_list.itemDoubleClicked.connect(self._on_file_item_double_clicked)
         root.addWidget(self.file_list)
 
         # ---- папка сохранения ----
@@ -243,7 +252,27 @@ class MainWindow(QMainWindow):
     def _clear_files(self) -> None:
         self.selected_files.clear()
         self.file_list.clear_files()
+        self.output_paths.clear()
         self._update_files_count_label()
+
+    def _open_settings_dialog(self) -> None:
+        dialog = SettingsDialog(self.settings, self)
+        if dialog.exec() == SettingsDialog.DialogCode.Accepted:
+            self.settings = dialog.result_settings()
+            self.logger.info(
+                "Настройки изменены: язык=%s, DPI=%d, потоков=%d",
+                self.settings.ocr_languages,
+                self.settings.render_dpi,
+                self.settings.max_workers,
+            )
+
+    def _on_file_item_double_clicked(self, item) -> None:
+        row = self.file_list.row(item)
+        if 0 <= row < len(self.selected_files):
+            path = self.selected_files[row]
+            out_path = self.output_paths.get(path)
+            if out_path and os.path.isfile(out_path):
+                _open_folder(out_path)
 
     def _update_files_count_label(self) -> None:
         n = len(self.selected_files)
@@ -327,6 +356,7 @@ class MainWindow(QMainWindow):
         p = self._path_for_filename(file_name)
         if p:
             self.file_list.set_status(p, file_name, FileStatus.DONE, detail)
+            self.output_paths[p] = out_path
         msg = f"Готово: {file_name} → {os.path.basename(out_path)} ({detail})"
         if warnings:
             for w in warnings:

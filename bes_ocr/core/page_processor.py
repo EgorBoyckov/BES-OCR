@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import statistics
 import time
+from dataclasses import replace
 
 from ..config.settings import Settings
 from .errors import PageProcessingError
@@ -17,7 +18,9 @@ from .models import BBox, ImageBlock, Page, Paragraph, Table
 from .ocr_engine import OcrEngine, binarize, deskew, find_noise_regions, is_plausible_word, stroke_width_px
 from .pdf_source import PdfSource
 from .table_detection import (
+    add_missed_tables,
     detect_tables_img2table,
+    detect_tables_ruling_lines,
     detect_tables_pdfplumber,
     fill_table_from_words,
     measure_cell_padding,
@@ -85,6 +88,49 @@ def _apply_text_layer_words_to_table(table: Table, words: list[LayoutWord]) -> N
                     for run in block.runs:
                         run.size_pt = size
                         run.bold = all_bold
+
+
+def _fix_vertical_bars(words: list[LayoutWord]) -> list[LayoutWord]:
+    """Одиночная "|" в тексте вне таблиц: высотой с цифру — это "1" (в
+    Times New Roman единица на скане похожа на черту: "Приложение |"),
+    выше строки — обрывок линии, не текст."""
+    result = []
+    for w in words:
+        if w.text in ("|", "||", "l|", "|l") or (w.text == "l" and w.x1 - w.x0 < 0.3 * w.size_pt):
+            height = w.y1 - w.y0
+            if w.text in ("|", "l") and 0.55 * w.size_pt <= height <= 0.85 * w.size_pt:
+                result.append(replace(w, text="1"))
+            continue
+        result.append(w)
+    return result
+
+
+def _plausible_count(words) -> int:
+    return sum(1 for w in words if is_plausible_word(w.text.strip("|_[]")))
+
+
+def _merge_cell_ocr(ocr_words, tables: list[Table], binary, ocr_engine: OcrEngine, px_to_pt: float):
+    """Слова страницы, в которых для ячеек без распознанного текста (или с
+    явно худшим результатом) подставлено распознавание самой ячейки."""
+    result = list(ocr_words)
+    for t in tables:
+        for row in t.rows:
+            for cell in row.cells:
+                if cell.is_merge_continuation or cell.bbox is None:
+                    continue
+                b = cell.bbox
+                x0, y0, x1, y1 = (int(round(v / px_to_pt)) for v in (b.x0, b.y0, b.x1, b.y1))
+                inside = [w for w in result if x0 <= (w.x0 + w.x1) / 2 <= x1 and y0 <= (w.y0 + w.y1) / 2 <= y1]
+                page_text = [w for w in inside if w.text.strip("|_[]—-")]
+                if page_text and len(page_text) >= 3:
+                    continue
+                cell_words = ocr_engine.recognize_region(binary, x0, y0, x1, y1)
+                if not cell_words:
+                    continue
+                if not page_text or _plausible_count(cell_words) > _plausible_count(page_text):
+                    ids = {id(w) for w in inside}
+                    result = [w for w in result if id(w) not in ids] + cell_words
+    return result
 
 
 def _encode_png(image) -> bytes | None:
@@ -198,41 +244,33 @@ def process_page(
 
             binary = binarize(ocr_image)
             tables = detect_tables_img2table(ocr_image, settings, px_to_pt, with_ocr=False)
+            # Запасной детектор по линиям разметки: таблица, которую img2table
+            # пропустила (так бывает на части окружений/версий библиотек),
+            # иначе превратилась бы в поток абзацев с "|" на месте линий.
+            try:
+                ruled = detect_tables_ruling_lines(ocr_image, px_to_pt, dpi=settings.render_dpi)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Страница %d: детектор таблиц по линиям не сработал (%s)", page_number + 1, exc)
+                ruled = []
+            found = len(tables)
+            tables = add_missed_tables(tables, ruled)
+            if len(tables) > found:
+                logger.info(
+                    "Страница %d: %d таблиц(ы) найдено по линиям разметки в дополнение к img2table",
+                    page_number + 1,
+                    len(tables) - found,
+                )
 
-            # Содержимое ячеек таблиц распознаётся по каждой ячейке
-            # отдельно (см. OcrEngine.recognize_region) и заменяет слова,
-            # найденные в области таблицы при распознавании всей страницы.
+            # Текст ячеек таблиц — по умолчанию из распознавания всей
+            # страницы (на реальном скане оно точнее: 97% слов шапки и
+            # строк таблицы против 91% при распознавании каждой ячейки
+            # отдельно). Отдельное распознавание ячейки (psm 6) — запасной
+            # вариант для ячеек, где распознавание страницы ничего не нашло
+            # или нашло заметно меньше осмысленных слов: в плотных таблицах
+            # сегментация всей страницы теряет содержимое узких граф ("№",
+            # номера строк).
             if tables:
-                boxes_px = [
-                    (t.bbox.x0 / px_to_pt, t.bbox.y0 / px_to_pt, t.bbox.x1 / px_to_pt, t.bbox.y1 / px_to_pt)
-                    for t in tables
-                    if t.bbox
-                ]
-                page_words = [
-                    w
-                    for w in ocr_words
-                    if not any(
-                        bx0 <= (w.x0 + w.x1) / 2 <= bx1 and by0 <= (w.y0 + w.y1) / 2 <= by1
-                        for bx0, by0, bx1, by1 in boxes_px
-                    )
-                ]
-                cell_words = []
-                for t in tables:
-                    for row in t.rows:
-                        for cell in row.cells:
-                            if cell.is_merge_continuation or cell.bbox is None:
-                                continue
-                            b = cell.bbox
-                            cell_words.extend(
-                                ocr_engine.recognize_region(
-                                    binary,
-                                    int(round(b.x0 / px_to_pt)),
-                                    int(round(b.y0 / px_to_pt)),
-                                    int(round(b.x1 / px_to_pt)),
-                                    int(round(b.y1 / px_to_pt)),
-                                )
-                            )
-                ocr_words = page_words + cell_words
+                ocr_words = _merge_cell_ocr(ocr_words, tables, binary, ocr_engine, px_to_pt)
 
             # Порог уверенности отсекает мусор, но правильно прочитанные
             # "нормальные" слова оставляем даже при низкой уверенности —
@@ -335,7 +373,7 @@ def process_page(
                 # Одиночные "слова" гигантского кегля из обрывков штрихов.
                 return w.size_pt > 2.0 * body_font_size and not is_plausible_word(w.text)
 
-            words = [w for w in all_words if not _is_noise(w)]
+            words = [w for w in _fix_vertical_bars(all_words) if not _is_noise(w)]
             page.used_ocr = True
 
         table_bboxes = [t.bbox for t in tables if t.bbox]

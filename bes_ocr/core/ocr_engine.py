@@ -99,23 +99,29 @@ def preprocess_for_ocr(image_bgr: np.ndarray, do_deskew: bool = True) -> np.ndar
 
 
 def stroke_width_px(binary: np.ndarray, x0: float, y0: float, x1: float, y1: float) -> float | None:
-    """Типичная толщина штриха символов внутри рамки (в пикселях) — по
-    гребню карты расстояний до фона. Используется для распознавания
-    полужирного начертания: у OCR нет информации о шрифте, но полужирный
-    текст на скане заметно "толще" обычного того же кегля."""
+    """Типичная толщина штриха символов внутри рамки (в пикселях) —
+    2·площадь / периметр чернил (для штриха ширины w и длины L площадь
+    w·L, периметр ≈ 2L). Используется для распознавания полужирного
+    начертания: у OCR нет информации о шрифте, но полужирный текст на
+    скане заметно "толще" обычного того же кегля.
+
+    Оценка непрерывная, в отличие от медианы карты расстояний до фона:
+    та на мелком тексте принимает лишь несколько дискретных значений
+    (шаг ~0.5 пикселя ≈ 10–15% толщины штриха), и обычная строка
+    случайно попадала в "полужирные"."""
     h, w = binary.shape[:2]
     xa, ya, xb, yb = max(0, int(x0)), max(0, int(y0)), min(w, int(x1)), min(h, int(y1))
     if xb - xa < 3 or yb - ya < 3:
         return None
     ink = (binary[ya:yb, xa:xb] == 0).astype(np.uint8)
-    if int(ink.sum()) < 15:
+    area = int(ink.sum())
+    if area < 15:
         return None
-    dist = cv2.distanceTransform(ink, cv2.DIST_L2, 3)
-    ridge = (dist > 0) & (dist >= cv2.dilate(dist, np.ones((3, 3), np.uint8)))
-    values = dist[ridge]
-    if values.size == 0:
+    contours, _ = cv2.findContours(ink, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+    perimeter = sum(cv2.arcLength(c, True) for c in contours)
+    if perimeter <= 0:
         return None
-    return float(2.0 * np.median(values))
+    return float(2.0 * area / perimeter)
 
 
 class OcrEngine:
@@ -210,11 +216,16 @@ class OcrEngine:
 
 
 _PLAUSIBLE_WORD_RE = re.compile(
-    r"^[«\"'(\[]?("
+    r"^[«\"'(\[№]?("
     r"[А-ЯЁа-яё]{3,}(-[А-ЯЁа-яё]+)*"
     r"|[A-Za-z]{3,}(-[A-Za-z]+)*"
     r"|\d+([.,:/-]\d+)*"
-    r")[»\"')\].,:;!?]{0,2}$"
+    r")[»\"')\].,:;!?№]{0,3}$"
+)
+
+
+_EMAIL_OR_URL_RE = re.compile(
+    r"^[\w.+-]+@[\w-]+(\.[\w-]+)+[.,;]?$|^(https?://|www\.)[\w./-]+[.,;]?$", re.IGNORECASE
 )
 
 
@@ -224,6 +235,8 @@ def is_plausible_word(text: str) -> bool:
     плохо: на реальных сканах правильно прочитанные слова нередко получают
     20–30%, и отбрасывать их только по порогу — значит терять текст."""
     text = text.strip()
+    if _EMAIL_OR_URL_RE.match(text):
+        return True
     if not _PLAUSIBLE_WORD_RE.match(text):
         return False
     letters = [ch for ch in text if ch.isalpha()]

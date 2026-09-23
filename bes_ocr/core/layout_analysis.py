@@ -112,6 +112,51 @@ def _weighted_median(pairs: list[tuple[float, float]]) -> Optional[float]:
     return pairs[-1][0]
 
 
+def _bold_threshold(pairs: list[tuple[float, float]]) -> float:
+    """Порог относительной толщины штриха, выше которого строка полужирная.
+
+    Толщины строк одного кегля образуют один класс (только обычный текст)
+    или два (обычный и полужирный) с заметным разрывом между ними. Порог —
+    посередине самого большого разрыва (по отношению соседних значений),
+    если он не меньше 10% и ниже разрыва остаётся основная масса текста;
+    иначе полужирного в группе нет (порог — заведомо выше всех значений,
+    с запасом 25% над нижним квартилем)."""
+    values = sorted((v, w) for v, w in pairs if v)
+    if not values:
+        return float("inf")
+    total = sum(w for _, w in values)
+    base = _weighted_quantile(values, 0.3) or values[0][0]
+    best_gap, best_threshold = 1.0, base * 1.25
+    acc = 0.0
+    for (lo, w), (hi, _) in zip(values, values[1:]):
+        acc += w
+        if acc < 0.3 * total or lo <= 0:
+            continue
+        gap = hi / lo
+        if gap > best_gap:
+            best_gap, best_threshold = gap, (lo * hi) ** 0.5
+    if best_gap >= 1.1 and best_threshold >= base * 1.08:
+        return best_threshold
+    return base * 1.25
+
+
+def _weighted_quantile(pairs: list[tuple[float, float]], q: float) -> Optional[float]:
+    """Взвешенный квантиль. Для опорной толщины штриха обычного текста
+    берётся нижний (~30%) квантиль, а не медиана: иначе многословный
+    полужирный заголовок сам сдвигает опорное значение вверх, и порог
+    "полужирности" оказывается между классами неудачно."""
+    pairs = sorted((v, w) for v, w in pairs if v is not None and w > 0)
+    if not pairs:
+        return None
+    total = sum(w for _, w in pairs)
+    acc = 0.0
+    for v, w in pairs:
+        acc += w
+        if acc >= total * q:
+            return v
+    return pairs[-1][0]
+
+
 def _percentile(values: list[float], p: float) -> float:
     s = sorted(values)
     idx = min(len(s) - 1, max(0, int(round(p * (len(s) - 1)))))
@@ -257,11 +302,9 @@ def normalize_ocr_words(words: list[LayoutWord], default_size: float = 11.0) -> 
             for j in raw_size
             if stroke_ratio[j] and abs(raw_size[j] - raw_size[i]) <= raw_size[i] * 0.15
         ]
-        if sum(w for _, w in peers) >= 60:
-            ref, threshold = _weighted_median(peers), 1.2
-        else:
-            ref, threshold = global_ref, 1.25
-        bold_line[i] = r > ref * threshold
+        if sum(w for _, w in peers) < 60:
+            peers = all_ratios
+        bold_line[i] = r >= _bold_threshold(peers)
 
     # Уточнение кегля полужирных строк по ширинам полужирного начертания
     # (оно шире обычного, иначе кегль заголовка завышается на ~5%).
@@ -362,6 +405,34 @@ def _alignment_shape(prev: LayoutLine, line: LayoutLine, tol: float) -> tuple[bo
     return left_ok, center_ok, right_ok
 
 
+def _chain_line_pitch(blocks: list[Paragraph]) -> None:
+    """Абзацы, идущие вплотную друг к другу (следующий начинается на
+    следующей строке), получают шаг строк, точно ведущий к базовой линии
+    следующего абзаца.
+
+    Шаг, измеренный внутри абзаца, от абзаца к абзацу немного "гуляет"
+    (±0.3pt), а перенести следующий абзац ВЫШЕ текстовый процессор не
+    может — отрицательного отступа перед абзацем нет. Без этой поправки
+    погрешность копится только вниз: на странице из десятка абзацев текст
+    внизу оказывался на 10pt ниже оригинала."""
+    for a, b in zip(blocks, blocks[1:]):
+        if a.baseline_pt is None or b.baseline_pt is None:
+            continue
+        size_a = _weighted_median([(r.size_pt, len(r.text)) for r in a.runs if r.text.strip()]) or 0.0
+        size_b = _weighted_median([(r.size_pt, len(r.text)) for r in b.runs if r.text.strip()]) or 0.0
+        if not size_a or abs(size_a - size_b) > 0.6:
+            continue
+        n = max(1, a.n_lines)
+        pitch = a.line_pitch_pt or b.line_pitch_pt or size_a * 1.15
+        step = (b.baseline_pt - a.baseline_pt) / n
+        # "Вплотную": до следующего абзаца ровно n строк с тем же шагом.
+        # Допуск 20%: у однострочных строк базовая линия по OCR "гуляет" на
+        # 1–1.5pt; нижняя граница шага — чтобы при точном интервале не
+        # обрезались верхушки заглавных букв.
+        if abs(step - pitch) <= 0.2 * pitch and step >= size_a * 1.05:
+            a.line_pitch_pt = step
+
+
 class _ParagraphBuilder:
     """Группирует строки одного "потока" текста (страница или колонка) в
     абзацы и определяет их выравнивание относительно границ потока."""
@@ -406,6 +477,7 @@ class _ParagraphBuilder:
             block.space_before_pt = max(0.0, gap)
             prev_bottom = g[-1].y1
             blocks.append(block)
+        _chain_line_pitch(blocks)
         return blocks
 
     def _continues(self, group: list[LayoutLine], line: LayoutLine) -> Optional[bool]:
@@ -435,6 +507,10 @@ class _ParagraphBuilder:
             # не по маркеру.
             text_x = group[0].words[1].x0 if len(group) == 1 else prev.x0
             left_ok = abs(line.x0 - text_x) <= tol or abs(line.x0 - group[0].x0) <= tol
+            # Маркер в "красной строке", продолжение — от левого края
+            # потока ("3. Проведена оценка ..." / "практики:").
+            if len(group) == 1 and abs(line.x0 - self.x_left) <= tol and line.x0 < group[0].x0 - tol:
+                left_ok = True
         # Первая строка абзаца может иметь красную строку (отступ первой
         # строки) — вторая строка тогда начинается левее первой.
         first_line_indent = len(group) == 1 and 0 < prev.x0 - line.x0 <= 6 * size and line.x0 >= self.x_left - tol
@@ -534,10 +610,15 @@ class _ParagraphBuilder:
             if not self.list_indent_stack or marker_x > self.list_indent_stack[-1] + self._LIST_INDENT_TOLERANCE:
                 self.list_indent_stack.append(marker_x)
             level = len(self.list_indent_stack) - 1
-            common.update(indent_pt=text_x, first_line_indent_pt=marker_x - text_x)
+            left = text_x
+            if len(group) > 1:
+                cont_x = min(ln.x0 for ln in group[1:])
+                if cont_x < text_x - tol:
+                    left = cont_x  # продолжение левее текста пункта
+            common.update(indent_pt=left, first_line_indent_pt=marker_x - left)
             if common["alignment"] in (Alignment.CENTER, Alignment.RIGHT):
                 common["alignment"] = Alignment.LEFT
-            return ListItem(ordered=ordered, marker=marker, level=level, **common)
+            return ListItem(ordered=ordered, marker=marker, level=level, text_x_pt=text_x, **common)
 
         text = "".join(r.text for r in runs).strip()
         heading_candidate = len(group[0].words) >= 2 or len(text) >= 4
@@ -779,10 +860,37 @@ def _evaluate_band(lines, i, j, intervals, x_left, x_right) -> Optional[_ColumnB
         if len(consistent) < 3:
             continue
         start, end = consistent[0], consistent[-1]
+
+        # Соседние строки, которые явно принадлежат колонкам, но не
+        # "опираются" на коридор (подпись "Руководитель" с отступом, строка
+        # подписей "____ А.Ю. Коковихин      ____ /Хрипунов И.А./"):
+        # текст целиком по одну сторону коридора или по обе, но с широким
+        # промежутком. У строки обычного абзаца, чей пробел случайно
+        # совпал с коридором, промежуток — обычный растянутый пробел.
+        def belongs(k: int) -> bool:
+            left = [w for w in lines[k].words if w.x1 <= g0 + 0.5]
+            right = [w for w in lines[k].words if w.x0 >= g1 - 0.5]
+            if len(left) + len(right) != len(lines[k].words):
+                return False
+            if left and right:
+                return min(w.x0 for w in right) - max(w.x1 for w in left) >= max(20.0, 1.8 * size)
+            return True
+
+        def near(a: int, b: int) -> bool:
+            return abs(lines[b].y0 - lines[a].y1) <= 2.5 * size
+
+        while end + 1 <= j and near(end, end + 1) and belongs(end + 1):
+            end += 1
+        while end + 1 < len(lines) and near(end, end + 1) and belongs(end + 1) and _fits_gutter(lines[end + 1], g0, g1):
+            end += 1
         cand = _ColumnBand(start, end, g0, g1)
         if best is None or (cand.end - cand.start) > (best.end - best.start):
             best = cand
     return best
+
+
+def _fits_gutter(line: LayoutLine, g0: float, g1: float) -> bool:
+    return not any(w.x0 < g1 - 0.5 and w.x1 > g0 + 0.5 for w in line.words)
 
 
 def _split_line(line: LayoutLine, g0: float, g1: float) -> tuple[Optional[LayoutLine], Optional[LayoutLine]]:

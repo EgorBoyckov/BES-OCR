@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import copy
 import io
+from dataclasses import replace
 import logging
 import re
 import statistics
@@ -35,6 +36,7 @@ from docx.shared import Emu, Pt, RGBColor
 from PIL import Image as PILImage
 
 from .errors import DocxWriteError
+from .font_metrics import advance_em
 from .models import (
     Alignment,
     Document,
@@ -42,6 +44,7 @@ from .models import (
     ImageBlock,
     ListItem,
     Paragraph,
+    Run,
     Table,
 )
 
@@ -116,6 +119,12 @@ _KNOWN_FONTS = {
     "ptserif": "PT Serif",
     "ptsans": "PT Sans",
 }
+
+
+def font_metrics_advance(text: str) -> float:
+    """Ширина текста в em (Times New Roman); для неизвестных глифов —
+    грубая оценка 0.5 em на символ."""
+    return advance_em(text) or 0.5 * len(text)
 
 
 def clean_font_name(raw: Optional[str]) -> Optional[str]:
@@ -366,9 +375,14 @@ class _Box:
     """Горизонтальные границы контейнера (страница или ячейка) в
     координатах исходной страницы."""
 
-    def __init__(self, left: float, right: float, max_outdent: float = 0.0, page_width: float = 0.0):
+    def __init__(
+        self, left: float, right: float, max_outdent: float = 0.0, page_width: float = 0.0, bottom: Optional[float] = None
+    ):
         self.left = left
         self.right = right
+        # Нижняя граница контейнера (ячейки): текст не должен её превышать,
+        # иначе строка таблицы в Word становится выше, чем в оригинале.
+        self.bottom = bottom
         self.page_width = page_width
         # Насколько абзац может выступать влево за границу контейнера
         # (на странице — в поле; в ячейке — нисколько).
@@ -379,11 +393,15 @@ class _Flow:
     """Вертикальный "курсор" потока блоков внутри контейнера: y (в
     координатах исходной страницы), до которой уже дошёл текст в Word."""
 
-    def __init__(self, top: Optional[float]):
+    def __init__(self, top: Optional[float], scale: float = 1.0):
         self.cursor = top
         self.last_paragraph = None
         self.last_was_table = False
         self.first_paragraph = None
+        # Сжатие вертикальных расстояний (только в ячейках, чьё содержимое
+        # иначе не поместилось бы в высоту строки оригинала).
+        self.origin = top
+        self.scale = scale
 
 
 class _Writer:
@@ -421,12 +439,25 @@ class _Writer:
             # Геометрия известна: точный межстрочный шаг и положение
             # базовой линии как в оригинале.
             pitch = _block_pitch(block, self.pitch_ratio)
+            box_top = block.baseline_pt - pitch * _BASELINE_RATIO
+            if flow.scale < 1.0 and flow.origin is not None:
+                pitch = max(size * 1.02, pitch * flow.scale)
+                box_top = flow.origin + (box_top - flow.origin) * flow.scale
             pf.line_spacing_rule = WD_LINE_SPACING.EXACTLY
             pf.line_spacing = Pt(round(pitch, 2))
-            box_top = block.baseline_pt - pitch * _BASELINE_RATIO
             before = 0.0
             if flow.cursor is not None:
                 before = max(0.0, box_top - flow.cursor)
+            if box.bottom is not None and flow.cursor is not None:
+                excess = flow.cursor + before + pitch * max(1, block.n_lines) - box.bottom
+                if excess > 0:
+                    cut = min(before, excess)
+                    before -= cut
+                    box_top -= cut
+                    excess -= cut
+                if excess > 0:
+                    pitch = max(size * 1.02, pitch - excess / max(1, block.n_lines))
+                    pf.line_spacing = Pt(round(pitch, 2))
             pf.space_before = Pt(round(min(before, 400.0), 2))
             top = box_top if flow.cursor is None else max(flow.cursor, box_top)
             flow.cursor = top + pitch * max(1, block.n_lines)
@@ -456,7 +487,12 @@ class _Writer:
             if flow.cursor is not None and block.bbox is not None:
                 flow.cursor = block.bbox.y1
 
-        for run_data in block.runs:
+        runs = list(block.runs)
+        if isinstance(block, ListItem) and block.marker:
+            runs = self._literal_marker_runs(p, block, box, runs)
+        if block.baseline_pt is not None:
+            runs = _fit_forced_lines(block, runs, box, size)
+        for run_data in runs:
             if not run_data.text:
                 continue
             r = p.add_run(run_data.text)
@@ -472,6 +508,43 @@ class _Writer:
         mark_font = (clean_font_name(first_run.font_name) if first_run else None) or self.font_name
         _set_paragraph_mark_font(p, size, mark_font, bold=bool(first_run and first_run.bold and isinstance(block, ListItem)))
         return p
+
+    def _literal_marker_runs(self, p, block: ListItem, box: _Box, runs: list) -> list:
+        """Маркер пункта списка — обычным текстом, как в оригинале.
+        Автонумерация стиля отключается (numId=0): иначе Word продолжает
+        нумерацию через весь документ ("5.", "6." вместо "1.", "2." во
+        втором списке) и заменяет "-" на "•"."""
+        ppr = p._p.get_or_add_pPr()
+        num_pr = OxmlElement("w:numPr")
+        ilvl = OxmlElement("w:ilvl")
+        ilvl.set(qn("w:val"), "0")
+        num_id = OxmlElement("w:numId")
+        num_id.set(qn("w:val"), "0")
+        num_pr.append(ilvl)
+        num_pr.append(num_id)
+        ppr.insert(1 if ppr.find(qn("w:pStyle")) is not None else 0, num_pr)
+
+        first = next((r for r in runs if r.text.strip()), None)
+        size = first.size_pt if first else _dominant_size(block)
+        separator = " "
+        if block.text_x_pt is not None and block.bbox is not None:
+            marker_x = block.indent_pt + block.first_line_indent_pt
+            gap = block.text_x_pt - marker_x - (font_metrics_advance(block.marker) * size)
+            # Широкий промежуток после маркера — табуляция до начала текста
+            # пункта (у списков с выступом это и есть левый отступ).
+            if gap > 0.6 * size:
+                separator = "\t"
+                if block.text_x_pt - block.indent_pt > 1.0:
+                    p.paragraph_format.tab_stops.add_tab_stop(Pt(round(block.text_x_pt - box.left, 2)))
+        marker_run = Run(
+            text=block.marker + separator,
+            bold=first.bold if first else False,
+            italic=first.italic if first else False,
+            size_pt=size,
+            font_name=first.font_name if first else None,
+            char_spacing_pt=first.char_spacing_pt if first else 0.0,
+        )
+        return [marker_run] + runs
 
     def _spacer(self, container, flow: _Flow, height: float):
         """Пустой абзац заданной высоты (перед таблицей, между таблицами)."""
@@ -572,9 +645,13 @@ class _Writer:
                     cell_pad = _cell_padding(cell, padding)
                     if cell_pad < padding - 0.05:
                         _set_cell_margins(docx_cell, cell_pad)
-                    cell_box = _Box(cell.bbox.x0 + cell_pad, cell.bbox.x1 - cell_pad)
+                    cell_bottom = None if table.borderless or cell.v_align != "top" else cell.bbox.y1 - 0.5
+                    cell_box = _Box(cell.bbox.x0 + cell_pad, cell.bbox.x1 - cell_pad, bottom=cell_bottom)
                     cell_top = table_top if table.borderless and table_top is not None else cell.bbox.y0
-                    cell_flow = _Flow(cell_top if cell.v_align == "top" else None)
+                    scale = 1.0
+                    if cell.v_align == "top" and not table.borderless:
+                        scale = self._cell_fit_scale(cell, cell_top)
+                    cell_flow = _Flow(cell_top if cell.v_align == "top" else None, scale=scale)
                 else:
                     x0 = col_x[c] + padding
                     cell_box = _Box(x0, x0 + span_w - 2 * padding)
@@ -599,6 +676,24 @@ class _Writer:
         flow.last_was_table = True
         if table.bbox is not None and flow.cursor is not None:
             flow.cursor = max(flow.cursor, table.bbox.y1)
+
+    def _cell_fit_scale(self, cell, top: float) -> float:
+        """Во сколько раз сжать вертикальные расстояния в ячейке, чтобы её
+        содержимое (по той же модели позиций, что и при записи) поместилось
+        в высоту ячейки оригинала — иначе строка таблицы в Word выше
+        оригинальной, и всё ниже таблицы сползает."""
+        cursor = top
+        for b in cell.blocks:
+            if not isinstance(b, Paragraph) or b.baseline_pt is None or not b.text.strip():
+                continue
+            pitch = _block_pitch(b, self.pitch_ratio)
+            box_top = b.baseline_pt - pitch * _BASELINE_RATIO
+            cursor = max(cursor, box_top) + pitch * max(1, b.n_lines)
+        available = cell.bbox.y1 - 0.5 - top
+        needed = cursor - top
+        if needed <= available or needed <= 0:
+            return 1.0
+        return max(0.7, available / needed)
 
     def _set_table_layout(self, docx_table, table: Table, box: _Box) -> None:
         tbl_pr = docx_table._tbl.tblPr
@@ -769,6 +864,42 @@ def _list_style(block: ListItem) -> str:
     styles = _LIST_STYLES_ORDERED if block.ordered else _LIST_STYLES_BULLET
     idx = min(max(block.level, 0), len(styles) - 1)
     return styles[idx]
+
+
+def _fit_forced_lines(block: Paragraph, runs: list, box: "_Box", size: float) -> list:
+    """Строки, заканчивающиеся принудительным переносом (и однострочные
+    абзацы), должны поместиться в свою ширину целиком: если набранная
+    шрифтом Word строка окажется шире, она перенесётся ещё раз посреди
+    слова ("прохождени-я"). Такой абзац слегка уплотняется межбуквенным
+    интервалом."""
+    text = "".join(r.text for r in runs)
+    lines = text.split("\n")
+    if len(lines) == 1 and block.n_lines > 1:
+        return runs  # естественные переносы делает сам текстовый процессор
+    right = block.right_edge_pt if block.right_edge_pt is not None else box.right
+    right = min(right, box.right)
+    avail = right - _WRAP_SLACK_PT - max(block.indent_pt, box.left)
+    if avail <= 0:
+        return runs
+    bold = any(r.bold for r in runs if r.text.strip())
+    spacing = min((r.char_spacing_pt for r in runs if r.text.strip()), default=0.0)
+    needed = spacing
+    for i, line in enumerate(lines):
+        line = line.replace("\t", " ")
+        if not line.strip():
+            continue
+        adv = advance_em(line.replace(" ", ""), bold)
+        if adv is None:
+            continue
+        spaces = line.count(" ")
+        width_at_zero = (adv + spaces * 0.25) * size
+        line_avail = avail - (block.first_line_indent_pt if i == 0 and block.first_line_indent_pt > 0 else 0.0)
+        if width_at_zero + spacing * len(line) > line_avail:
+            needed = min(needed, (line_avail - width_at_zero) / len(line))
+    if needed >= spacing - 0.005:
+        return runs
+    needed = max(needed, -0.12 * size)
+    return [replace(r, char_spacing_pt=round(needed, 2)) for r in runs]
 
 
 def _cell_padding(cell, table_padding: float) -> float:

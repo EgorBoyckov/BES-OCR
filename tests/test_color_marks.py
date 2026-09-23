@@ -3,7 +3,7 @@ import io
 
 import numpy as np
 import pytest
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
 from bes_ocr.core.color_marks import extract_color_marks
 
@@ -35,7 +35,7 @@ def test_stamp_is_cut_out_with_transparency_and_erased_but_black_text_kept():
     assert alpha.max() == 255 and (alpha == 0).mean() > 0.5  # фон прозрачный
 
     # Синего в растре для OCR не осталось, а чёрный текст под печатью цел.
-    b, g, r = cleaned[:, :, 0].astype(int), cleaned[:, :, 1].astype(int), cleaned[:, :, 2].astype(int)
+    b, r = cleaned[:, :, 0].astype(int), cleaned[:, :, 2].astype(int)
     assert int(((b - r) > 60).sum()) < 50
     text_region = cleaned[330:390, 100:1000]
     assert int((text_region.max(axis=2) < 80).sum()) > 2000
